@@ -1,0 +1,16 @@
+Flask>=2.2,<4
+flask-cors>=3.0.10
+pytz
+pandas>=1.5
+XlsxWriter
+gunicorn
+
+playwright>=1.48.0
+greenlet>=3.1.0
+
+# MT4 API 系统依赖
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+
+pydantic>=2.0.0
+
