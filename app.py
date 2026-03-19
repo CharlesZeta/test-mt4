@@ -244,14 +244,15 @@ def api_latest_status():
         latest_status_record = history_status[0] if history_status else None
         latest_positions_record = history_positions[0] if history_positions else None
 
+        # 优先：从 /api/tick 推送的数据（desc=QUOTE_DATA，直接有 symbol 和 bid/ask）
         for record in history_report:
             parsed = record.get("parsed")
-            if parsed and parsed.get("desc") == "QUOTE_DATA":
+            if not isinstance(parsed, dict):
+                continue
+            if parsed.get("desc") == "QUOTE_DATA":
                 record_symbol = parsed.get("symbol", "")
-
                 if symbol_filter and record_symbol and record_symbol != symbol_filter:
                     continue
-
                 try:
                     msg = parsed.get("message", "{}")
                     quote_data = json.loads(msg)
@@ -265,8 +266,48 @@ def api_latest_status():
                             "received_at": record.get("received_at"),
                         }
                         break
-                except:
+                except (json.JSONDecodeError, TypeError):
                     pass
+
+        # 兜底：直接从 history_report 找任意带 bid/ask 的记录（MT4 quote/report 推送）
+        if latest_quote is None:
+            for record in history_report:
+                parsed = record.get("parsed")
+                if not isinstance(parsed, dict):
+                    continue
+                record_symbol = parsed.get("symbol", "")
+                if symbol_filter and record_symbol and record_symbol != symbol_filter:
+                    continue
+                bid = parsed.get("bid")
+                ask = parsed.get("ask")
+                if bid is not None and ask is not None:
+                    latest_quote = {
+                        "bid": bid,
+                        "ask": ask,
+                        "symbol": record_symbol,
+                        "spread": parsed.get("spread"),
+                        "ts": parsed.get("ts"),
+                        "received_at": record.get("received_at"),
+                    }
+                    break
+
+        # 兜底：从 MT4 status 的 positions 里尝试找对应品种的持仓均价作为参考
+        if latest_quote is None and latest_status_record:
+            parsed = latest_status_record.get("parsed", {})
+            if symbol_filter:
+                positions = parsed.get("positions") or []
+                for pos in positions:
+                    pos_symbol = norm_str(pos.get("symbol", ""))
+                    if pos_symbol == symbol_filter:
+                        latest_quote = {
+                            "bid": None,
+                            "ask": None,
+                            "symbol": symbol_filter,
+                            "spread": None,
+                            "ts": None,
+                            "received_at": latest_status_record.get("received_at"),
+                        }
+                        break
 
         if latest_status_record:
             parsed = latest_status_record.get("parsed", {})
@@ -283,22 +324,21 @@ def api_latest_status():
                 "leverage_used": parsed.get("leverage_used"),
                 "positions": parsed.get("positions") or (latest_positions_record.get("parsed", {}).get("positions") if latest_positions_record else []),
             }
-
-    if detail is None and latest_positions_record:
-        parsed = latest_positions_record.get("parsed", {})
-        detail = {
-            "received_at": latest_positions_record.get("received_at"),
-            "account": parsed.get("account"),
-            "server": parsed.get("server"),
-            "balance": None,
-            "equity": None,
-            "margin": None,
-            "free_margin": None,
-            "margin_level": None,
-            "floating_pnl": None,
-            "leverage_used": None,
-            "positions": parsed.get("positions") or [],
-        }
+        elif latest_positions_record:
+            parsed = latest_positions_record.get("parsed", {})
+            detail = {
+                "received_at": latest_positions_record.get("received_at"),
+                "account": parsed.get("account"),
+                "server": parsed.get("server"),
+                "balance": None,
+                "equity": None,
+                "margin": None,
+                "free_margin": None,
+                "margin_level": None,
+                "floating_pnl": None,
+                "leverage_used": None,
+                "positions": parsed.get("positions") or [],
+            }
 
     return jsonify({
         "detail": detail,
@@ -1134,17 +1174,27 @@ HTML_TEMPLATE = r"""<!doctype html>
           const spread = quote.spread != null ? quote.spread : ((quote.ask - quote.bid) * Math.pow(10, digits > 2 ? 0 : (5 - digits))).toFixed(1);
           if ($('spreadText')) $('spreadText').innerText = `点差: ${spread}`;
 
-          // 数据时间与延迟（服务器 0 时区；展示为本地/UTC+8）
+          // 数据时间与延迟（服务器 UTC -> 展示为 UTC+8 北京时间）
           const now = Date.now();
           if (quote.ts != null) {
+            // 服务器发来 UTC 秒（<1e12）或 UTC 毫秒（>=1e12）
             const serverMs = quote.ts < 1e12 ? quote.ts * 1000 : quote.ts;
-            const latency = Math.round(now - serverMs);
+            // Date.now() 是浏览器本地时间(UTC+8)，serverMs 是 UTC
+            // latency = (本地时间 ms) - (UTC 时间 ms) - 8小时补偿
+            // = (UTC ms + 8h) - UTC ms = 正确延迟
+            const latency = Math.round(now - serverMs - 8 * 3600 * 1000);
             window.lastDataTime = serverMs;
             if ($('latencyText')) $('latencyText').innerText = `延迟: ${latency}ms`;
             updateLatencySignal(latency);
             if ($('updateTimeText')) {
-              const dataTime = new Date(serverMs).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false });
-              $('updateTimeText').innerText = `数据: ${dataTime}`;
+              // UTC 时间 +8 小时 -> 北京时间显示
+              const d = new Date(serverMs + 8 * 3600 * 1000);
+              const mm = String(d.getUTCMonth() + 1).padStart(2, '0');
+              const dd = String(d.getUTCDate()).padStart(2, '0');
+              const hh = String(d.getUTCHours()).padStart(2, '0');
+              const mi = String(d.getUTCMinutes()).padStart(2, '0');
+              const ss = String(d.getUTCSeconds()).padStart(2, '0');
+              $('updateTimeText').innerText = `数据: ${mm}-${dd} ${hh}:${mi}:${ss}`;
             }
           } else if (quote.received_at && $('updateTimeText')) {
             $('updateTimeText').innerText = `更新: ${quote.received_at.split(' ')[1] || '--'}`;
@@ -1203,14 +1253,18 @@ HTML_TEMPLATE = r"""<!doctype html>
 
       // 边距：左侧留空、右侧给价格轴、底部给时间轴
       const PAD_LEFT = 12;
-      const PAD_RIGHT = 52;
+      const PAD_RIGHT = 60;
       const PAD_TOP = 12;
-      const PAD_BOTTOM = 26;
+      const PAD_BOTTOM = 28;
       const chartW = w - PAD_LEFT - PAD_RIGHT;
       const chartH = h - PAD_TOP - PAD_BOTTOM;
       if (chartW <= 0 || chartH <= 0) return;
 
-      const visibleBars = bars.slice(-80);
+      // 根据周期调整可见K线数量
+      const tf = window.currentTf || '5min';
+      const visibleCountMap = { "5min": 60, "10min": 50, "1hour": 40 };
+      const visibleCount = visibleCountMap[tf] || 60;
+      const visibleBars = bars.slice(-visibleCount);
       const n = visibleBars.length;
       if (n === 0) return;
 
@@ -1228,7 +1282,7 @@ HTML_TEMPLATE = r"""<!doctype html>
       maxP += extra;
       const priceToY = p => PAD_TOP + chartH - ((p - minP) / (maxP - minP)) * chartH;
 
-      const barGap = 2;
+      const barGap = 3;
       const barTotalW = chartW / n;
       const barW = Math.max(2, Math.floor(barTotalW) - barGap);
 
@@ -1270,7 +1324,7 @@ HTML_TEMPLATE = r"""<!doctype html>
         ctx.fillRect(x - barW / 2, yTop, barW, bodyH);
       }
 
-      // 价格轴（右侧，在留白内）
+      // 价格轴（右侧）
       const digits = getPriceDigits(window.currentSymbol);
       ctx.fillStyle = '#848e9c';
       ctx.font = '11px monospace';
@@ -1281,7 +1335,7 @@ HTML_TEMPLATE = r"""<!doctype html>
         ctx.fillText(p.toFixed(digits), w - 8, y + 4);
       }
 
-      // 时间轴（底部）：服务器为 UTC，显示为本地时间（UTC+8）
+      // 时间轴（底部）：服务器 UTC -> 显示 UTC+8
       ctx.fillStyle = '#848e9c';
       ctx.font = '10px sans-serif';
       ctx.textAlign = 'center';
@@ -1289,8 +1343,14 @@ HTML_TEMPLATE = r"""<!doctype html>
       for (let i = 0; i < n; i += step) {
         const b = visibleBars[i];
         const tsMs = typeof b[0] === 'number' ? b[0] : b[0] * 1000;
-        const d = new Date(tsMs);
-        const label = d.getHours().toString().padStart(2,'0') + ':' + d.getMinutes().toString().padStart(2,'0');
+        // UTC -> UTC+8：加 8 小时
+        const d = new Date(tsMs + 8 * 60 * 60 * 1000);
+        let label;
+        if (tf === '1hour') {
+          label = `${d.getMonth() + 1}/${d.getDate()} ${d.getHours().toString().padStart(2,'0')}`;
+        } else {
+          label = `${d.getHours().toString().padStart(2,'0')}:${d.getMinutes().toString().padStart(2,'0')}`;
+        }
         const x = PAD_LEFT + (i + 0.5) * barTotalW;
         ctx.fillText(label, x, h - 8);
       }
