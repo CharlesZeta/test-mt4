@@ -14,6 +14,57 @@ app = Flask(__name__)
 # ==================== 全局数据结构 ====================
 MAX_HISTORY = 50
 
+# K线存储：symbol -> { "5min": [...], "10min": [...], "1hour": [...] }
+# 每根K线只保留 open/high/low/close
+# 数量限制：5min=300, 10min=250, 1hour=200，超出自动丢弃旧数据
+KLINE_MAX = {"5min": 300, "10min": 250, "1hour": 200}
+
+kline_data = {}          # { symbol: { tf: [ohlc_list] } }
+kline_locks = {}         # per-symbol locks
+
+def get_kline_lock(symbol):
+    if symbol not in kline_locks:
+        kline_locks[symbol] = threading.Lock()
+    return kline_locks[symbol]
+
+def _floor_ts(ts_ms, tf):
+    """将毫秒时间戳向下对齐到 tf 边界"""
+    if tf == "5min":
+        step = 5 * 60 * 1000
+    elif tf == "10min":
+        step = 10 * 60 * 1000
+    elif tf == "1hour":
+        step = 60 * 60 * 1000
+    else:
+        step = 60 * 1000
+    return (ts_ms // step) * step
+
+def update_kline(symbol, bid, ask, tick_ts_ms):
+    """用最新 tick 更新各周期 K 线，只保留 OHLC"""
+    mid = (bid + ask) / 2.0
+    tfs = ["5min", "10min", "1hour"]
+    with get_kline_lock(symbol):
+        if symbol not in kline_data:
+            kline_data[symbol] = {tf: [] for tf in tfs}
+
+        for tf in tfs:
+            bar_ts = _floor_ts(tick_ts_ms, tf)
+            bars = kline_data[symbol][tf]
+            max_len = KLINE_MAX[tf]
+
+            if bars and bars[-1][0] == bar_ts:
+                # 合并到当前 bar
+                bar = bars[-1]
+                bar[1] = max(bar[1], mid)   # high
+                bar[2] = min(bar[2], mid)   # low
+                bar[3] = mid                 # close
+            else:
+                # 新开一根 bar [ts, open, high, low, close]
+                bars.append([bar_ts, mid, mid, mid, mid])
+                # 丢弃超限旧数据
+                if len(bars) > max_len:
+                    bars[:] = bars[-max_len:]
+
 # 分类别存储，避免互相污染
 history_status = deque(maxlen=MAX_HISTORY)     # /mt4/status
 history_positions = deque(maxlen=MAX_HISTORY)  # /mt4/positions
@@ -291,6 +342,10 @@ def receive_tick():
             if not symbol or not bid or not ask:
                 continue
 
+            # 更新K线
+            tick_ts_ms = (tick_time * 1000) if tick_time else int(time.time() * 1000)
+            update_kline(symbol, float(bid), float(ask), tick_ts_ms)
+
             quote_msg = json.dumps({
                 "bid": bid,
                 "ask": ask
@@ -322,6 +377,21 @@ def receive_tick():
     except Exception as e:
         print(f"Error processing tick: {e}")
         return jsonify({'error': str(e)}), 500
+
+# ==================== K线数据接口 ====================
+@app.route("/api/kline", methods=["GET"])
+def api_kline():
+    symbol = request.args.get("symbol", "XAUUSD").upper()
+    tf = request.args.get("tf", "5min")
+    if tf not in KLINE_MAX:
+        tf = "5min"
+
+    limit = request.args.get("limit", KLINE_MAX[tf], type=int)
+    limit = min(limit, KLINE_MAX[tf])
+
+    with get_kline_lock(symbol):
+        bars = list(kline_data.get(symbol, {}).get(tf, []))
+    return jsonify({"symbol": symbol, "tf": tf, "bars": bars[-limit:]})
 
 # ==================== 产品规格接口 ====================
 @app.route("/api/products", methods=["GET"])
@@ -660,11 +730,12 @@ HTML_TEMPLATE = r"""<!doctype html>
     /* 响应式 */
     @media (max-width: 768px) {
       .app { padding: 1rem; padding-bottom: calc(1rem + var(--safe-bottom)); }
-      .symRow { padding: 1rem; }
       .symLeftTime { font-size: 1.5rem; }
       .symName { font-size: 1.375rem; }
       .price-value { font-size: 2rem; }
-      .iconBtn.huge-chart { width: 4rem; height: 4rem; font-size: 1.75rem; }
+      .symBidAsk { font-size: 1rem; }
+      .mainContent { display: flex; flex-direction: column; gap: 1rem; }
+      .chart-panel { height: 320px; }
       .modalMask { align-items: flex-end; padding: 0; }
       .modal {
         width: 100%;
@@ -675,6 +746,81 @@ HTML_TEMPLATE = r"""<!doctype html>
         padding-bottom: var(--safe-bottom);
       }
       @keyframes slideUp { from { transform: translateY(100%); } to { transform: translateY(0); } }
+    }
+
+    /* ===== 新增样式 ===== */
+    .mainContent {
+      display: grid;
+      grid-template-columns: 340px 1fr;
+      gap: 1rem;
+      margin-bottom: 1rem;
+    }
+
+    .symBidAsk {
+      display: flex;
+      flex-direction: column;
+      align-items: flex-end;
+      gap: 0.25rem;
+      font-size: 1.125rem;
+      font-weight: 800;
+      font-family: monospace;
+      min-width: 5rem;
+    }
+    .sba-bid { color: var(--green); }
+    .sba-ask { color: var(--red); }
+    .sba-sep { color: var(--muted); font-size: 0.875rem; }
+
+    /* K线图 */
+    .chart-panel {
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow);
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+      min-height: 300px;
+    }
+    .chart-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0.75rem 1rem;
+      border-bottom: 1px solid var(--line);
+      flex-shrink: 0;
+    }
+    .chart-title {
+      font-size: 0.875rem;
+      font-weight: 800;
+      color: var(--muted);
+    }
+    .tf-tabs { display: flex; gap: 0.25rem; }
+    .tf-tab {
+      padding: 0.25rem 0.75rem;
+      border-radius: 0.375rem;
+      border: 1px solid var(--line);
+      background: transparent;
+      color: var(--muted);
+      font-weight: 700;
+      font-size: 0.8125rem;
+      cursor: pointer;
+      transition: 0.15s;
+    }
+    .tf-tab.active {
+      background: var(--text);
+      color: #fff;
+      border-color: var(--text);
+    }
+    .chart-wrap {
+      flex: 1;
+      position: relative;
+      min-height: 0;
+    }
+    #klineCanvas {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
     }
   </style>
 </head>
@@ -708,27 +854,47 @@ HTML_TEMPLATE = r"""<!doctype html>
         </div>
       </div>
       <div class="symRight">
-        <button class="iconBtn huge-chart" title="查看详情" onclick="alert('功能开发中...')">📊</button>
+        <div class="symBidAsk">
+          <span class="sba-bid" id="sbaBid">--</span>
+          <span class="sba-sep">/</span>
+          <span class="sba-ask" id="sbaAsk">--</span>
+        </div>
       </div>
     </div>
 
-    <div class="price-card">
-      <div class="price-main">
-        <span class="price-value" id="midPrice">--</span>
-        <span class="price-suffix" id="priceSuffix"></span>
+    <div class="mainContent">
+      <div class="price-card">
+        <div class="price-main">
+          <span class="price-value" id="midPrice">--</span>
+          <span class="price-suffix" id="priceSuffix"></span>
+        </div>
+        <div class="price-detail">
+          <div class="price-item">
+            <span class="price-item-label">买入价 (Bid)</span>
+            <span class="price-item-value bid" id="bidPrice">--</span>
+          </div>
+          <div class="price-item">
+            <span class="price-item-label">中间价</span>
+            <span class="price-item-value" id="midPriceDetail">--</span>
+          </div>
+          <div class="price-item">
+            <span class="price-item-label">卖出价 (Ask)</span>
+            <span class="price-item-value ask" id="askPrice">--</span>
+          </div>
+        </div>
       </div>
-      <div class="price-detail">
-        <div class="price-item">
-          <span class="price-item-label">买入价 (Bid)</span>
-          <span class="price-item-value bid" id="bidPrice">--</span>
+
+      <div class="chart-panel">
+        <div class="chart-header">
+          <div class="chart-title">分时 K 线</div>
+          <div class="tf-tabs">
+            <button class="tf-tab active" data-tf="5min" onclick="switchTf(this)">5分钟</button>
+            <button class="tf-tab" data-tf="10min" onclick="switchTf(this)">10分钟</button>
+            <button class="tf-tab" data-tf="1hour" onclick="switchTf(this)">1小时</button>
+          </div>
         </div>
-        <div class="price-item">
-          <span class="price-item-label">中间价</span>
-          <span class="price-item-value" id="midPriceDetail">--</span>
-        </div>
-        <div class="price-item">
-          <span class="price-item-label">卖出价 (Ask)</span>
-          <span class="price-item-value ask" id="askPrice">--</span>
+        <div class="chart-wrap">
+          <canvas id="klineCanvas"></canvas>
         </div>
       </div>
     </div>
@@ -743,28 +909,6 @@ HTML_TEMPLATE = r"""<!doctype html>
       </div>
       <div class="status-item">
         <span id="updateTimeText">更新时间: --</span>
-      </div>
-    </div>
-
-    <div class="account-card">
-      <div class="account-title">账户信息</div>
-      <div class="account-grid">
-        <div class="account-item">
-          <span class="account-label">账户</span>
-          <span class="account-value" id="accountVal">--</span>
-        </div>
-        <div class="account-item">
-          <span class="account-label">服务器</span>
-          <span class="account-value" id="serverVal">--</span>
-        </div>
-        <div class="account-item">
-          <span class="account-label">余额</span>
-          <span class="account-value" id="balanceVal">--</span>
-        </div>
-        <div class="account-item">
-          <span class="account-label">净值</span>
-          <span class="account-value" id="equityVal">--</span>
-        </div>
       </div>
     </div>
   </div>
@@ -894,8 +1038,11 @@ HTML_TEMPLATE = r"""<!doctype html>
       if ($('midPrice')) $('midPrice').innerText = '--';
       if ($('midPriceDetail')) $('midPriceDetail').innerText = '--';
       if ($('spreadText')) $('spreadText').innerText = '点差: --';
+      if ($('sbaBid')) $('sbaBid').innerText = '--';
+      if ($('sbaAsk')) $('sbaAsk').innerText = '--';
       window.lastDataTime = 0;
       window.stagnationCount = 0;
+      drawEmptyChart();
       refreshData();
     }
 
@@ -915,14 +1062,6 @@ HTML_TEMPLATE = r"""<!doctype html>
         // 更新连接状态
         updateConnectionStatus(true);
 
-        // 更新账户信息
-        if (data.detail) {
-          if ($('accountVal')) $('accountVal').innerText = data.detail.account || '--';
-          if ($('serverVal')) $('serverVal').innerText = data.detail.server || '--';
-          if ($('balanceVal')) $('balanceVal').innerText = data.detail.balance != null ? fmtNum(data.detail.balance, 2) : '--';
-          if ($('equityVal')) $('equityVal').innerText = data.detail.equity != null ? fmtNum(data.detail.equity, 2) : '--';
-        }
-
         // 更新价格
         if (data.latest_quote) {
           const quote = data.latest_quote;
@@ -932,6 +1071,8 @@ HTML_TEMPLATE = r"""<!doctype html>
           if ($('askPrice')) $('askPrice').innerText = fmtNum(quote.ask, digits);
           if ($('midPrice')) $('midPrice').innerText = fmtNum((quote.bid + quote.ask) / 2, digits);
           if ($('midPriceDetail')) $('midPriceDetail').innerText = fmtNum((quote.bid + quote.ask) / 2, digits);
+          if ($('sbaBid')) $('sbaBid').innerText = fmtNum(quote.bid, digits);
+          if ($('sbaAsk')) $('sbaAsk').innerText = fmtNum(quote.ask, digits);
 
           // 更新点差
           const spread = quote.spread != null ? quote.spread : ((quote.ask - quote.bid) * Math.pow(10, digits > 2 ? 0 : (5 - digits))).toFixed(1);
@@ -947,7 +1088,6 @@ HTML_TEMPLATE = r"""<!doctype html>
           if (quote.ts) {
             const latency = now - quote.ts;
             window.lastDataTime = quote.ts;
-
             if ($('latencyText')) $('latencyText').innerText = `延迟: ${latency}ms`;
             updateLatencySignal(latency);
           }
@@ -957,6 +1097,148 @@ HTML_TEMPLATE = r"""<!doctype html>
         console.error('获取数据失败:', error);
         updateConnectionStatus(false);
       }
+    }
+
+    // 切换K线周期
+    function switchTf(btn) {
+      document.querySelectorAll('.tf-tab').forEach(t => t.classList.remove('active'));
+      btn.classList.add('active');
+      window.currentTf = btn.dataset.tf;
+      fetchKline();
+    }
+
+    // 获取并渲染K线
+    async function fetchKline() {
+      try {
+        const tf = window.currentTf || '5min';
+        const limitMap = { "5min": 300, "10min": 250, "1hour": 200 };
+        const resp = await fetch(`/api/kline?symbol=${window.currentSymbol}&tf=${tf}&limit=${limitMap[tf]}`);
+        const data = await resp.json();
+        if (data.bars && data.bars.length > 0) {
+          drawKline(data.bars);
+        } else {
+          drawEmptyChart();
+        }
+      } catch (e) {
+        console.error('K线获取失败', e);
+        drawEmptyChart();
+      }
+    }
+
+    // 柱线图渲染（OHLC烛台）
+    function drawKline(bars) {
+      const canvas = $('klineCanvas');
+      if (!canvas) return;
+      const ctx = canvas.getContext('2d');
+
+      const dpr = window.devicePixelRatio || 1;
+      const w = canvas.offsetWidth;
+      const h = canvas.offsetHeight;
+      canvas.width = w * dpr;
+      canvas.height = h * dpr;
+      ctx.scale(dpr, dpr);
+
+      ctx.clearRect(0, 0, w, h);
+
+      if (!bars || bars.length === 0) { drawEmptyChart(); return; }
+
+      // 只取可见数量（约80根）
+      const visibleBars = bars.slice(-80);
+      const n = visibleBars.length;
+      if (n === 0) return;
+
+      const PAD_LEFT = 8, PAD_RIGHT = 8, PAD_TOP = 16, PAD_BOTTOM = 28;
+      const chartW = w - PAD_LEFT - PAD_RIGHT;
+      const chartH = h - PAD_TOP - PAD_BOTTOM;
+
+      // 计算价格范围
+      let minP = Infinity, maxP = -Infinity;
+      for (const b of visibleBars) {
+        if (b[1] < minP) minP = b[1];
+        if (b[2] > maxP) maxP = b[2];
+        if (b[3] < minP) minP = b[3];
+        if (b[4] > maxP) maxP = b[4];
+      }
+      const priceRange = maxP - minP || 0.0001;
+      const extra = priceRange * 0.06;
+      minP -= extra;
+      maxP += extra;
+
+      const priceToY = p => PAD_TOP + chartH - ((p - minP) / (maxP - minP)) * chartH;
+      const barW = Math.max(2, Math.floor(chartW / n) - 2);
+
+      const green = '#0ecb81';
+      const red = '#f6465d';
+
+      // 画网格线
+      ctx.strokeStyle = 'rgba(0,0,0,0.05)';
+      ctx.lineWidth = 1;
+      ctx.setLineDash([4, 4]);
+      for (let i = 0; i <= 4; i++) {
+        const y = PAD_TOP + (chartH / 4) * i;
+        ctx.beginPath();
+        ctx.moveTo(PAD_LEFT, y);
+        ctx.lineTo(w - PAD_RIGHT, y);
+        ctx.stroke();
+      }
+      ctx.setLineDash([]);
+
+      // 画柱线（烛台）
+      for (let i = 0; i < n; i++) {
+        const b = visibleBars[i];
+        const open = b[1], high = b[2], low = b[3], close = b[4];
+        const isGreen = close >= open;
+        const color = isGreen ? green : red;
+        const x = PAD_LEFT + Math.floor((i / n) * chartW) + Math.floor(chartW / n / 2);
+
+        // 上下影线
+        ctx.strokeStyle = color;
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(x, priceToY(high));
+        ctx.lineTo(x, priceToY(low));
+        ctx.stroke();
+
+        // 实体
+        const yTop = priceToY(Math.max(open, close));
+        const yBot = priceToY(Math.min(open, close));
+        const bodyH = Math.max(1, yBot - yTop);
+        ctx.fillStyle = color;
+        ctx.fillRect(x - Math.floor(barW / 2), yTop, barW, bodyH);
+      }
+
+      // 价格标签
+      ctx.fillStyle = '#848e9c';
+      ctx.font = '10px monospace';
+      ctx.textAlign = 'left';
+      const digits = getPriceDigits(window.currentSymbol);
+      for (let i = 0; i <= 4; i++) {
+        const p = minP + ((maxP - minP) / 4) * (4 - i);
+        const y = PAD_TOP + (chartH / 4) * i;
+        ctx.fillText(p.toFixed(digits), w - PAD_RIGHT + 4, y + 3);
+      }
+    }
+
+    function drawEmptyChart() {
+      const canvas = $('klineCanvas');
+      if (!canvas) return;
+      const ctx = canvas.getContext('2d');
+      const w = canvas.offsetWidth;
+      const h = canvas.offsetHeight;
+      const dpr = window.devicePixelRatio || 1;
+      canvas.width = w * dpr;
+      canvas.height = h * dpr;
+      ctx.scale(dpr, dpr);
+      ctx.clearRect(0, 0, w, h);
+      ctx.fillStyle = '#848e9c';
+      ctx.font = '13px -apple-system, sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillText('暂无 K 线数据', w / 2, h / 2);
+    }
+
+    function resizeCanvas() {
+      if (window._klineTimer) clearTimeout(window._klineTimer);
+      window._klineTimer = setTimeout(fetchKline, 100);
     }
 
     // 更新延迟信号灯
@@ -1016,6 +1298,10 @@ HTML_TEMPLATE = r"""<!doctype html>
       refreshData();
       setInterval(refreshData, 2000);
       setInterval(checkPriceStagnation, 2000);
+      window.currentTf = '5min';
+      fetchKline();
+      setInterval(fetchKline, 3000);
+      window.addEventListener('resize', resizeCanvas);
     }
 
     init();
