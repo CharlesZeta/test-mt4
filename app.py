@@ -354,6 +354,7 @@ def _category_to_deque(category):
         "status":    history_status,
         "positions": history_positions,
         "report":    history_report,
+        "quote":     history_report,
         "poll":      history_poll,
         "echo":      history_echo,
     }.get(category)
@@ -608,11 +609,21 @@ def mt4_positions():
 @app.route("/web/api/mt4/report",    methods=["POST"])
 def mt4_report():
     parse_ok, category = raw_store(source="mt4")
+    # 同时尝试从 body_json 提取报价并更新快速缓存
+    raw_body = request.get_data(as_text=True) or ""
+    body_json, _ = try_parse_json(raw_body)
+    if isinstance(body_json, dict):
+        ingest_quote_from_parsed(body_json)
     return "OK", 200
 
 @app.route("/web/api/mt4/quote",      methods=["POST"])
 def mt4_quote():
     parse_ok, category = raw_store(source="mt4")
+    # 同时尝试从 body_json 提取报价并更新快速缓存
+    raw_body = request.get_data(as_text=True) or ""
+    body_json, _ = try_parse_json(raw_body)
+    if isinstance(body_json, dict):
+        ingest_quote_from_parsed(body_json)
     return "OK", 200
 
 @app.route("/web/api/echo",          methods=["POST"])
@@ -711,6 +722,38 @@ def api_debug_symbols():
                 raw = p["symbol"]
                 raw_syms[raw] = normalize_symbol(raw)
     return jsonify({"raw_to_normalized": raw_syms, "known_count": len(KNOWN_SYMBOLS)})
+
+@app.route("/api/debug/queues", methods=["GET"])
+def api_debug_queues():
+    """调试接口：查看所有队列状态"""
+    with history_lock:
+        report_sample = []
+        for r in list(history_report)[:5]:
+            report_sample.append({
+                "received_at": r.get("received_at"),
+                "path": r.get("path"),
+                "parsed_keys": list(r.get("parsed", {}).keys()) if isinstance(r.get("parsed"), dict) else str(type(r.get("parsed"))),
+                "has_desc": isinstance(r.get("parsed"), dict) and "desc" in r.get("parsed"),
+                "desc_value": r.get("parsed", {}).get("desc") if isinstance(r.get("parsed"), dict) else None,
+            })
+        status_sample = []
+        for r in list(history_status)[:3]:
+            status_sample.append({
+                "received_at": r.get("received_at"),
+                "path": r.get("path"),
+                "parsed_keys": list(r.get("parsed", {}).keys()) if isinstance(r.get("parsed"), dict) else None,
+            })
+    with quote_cache_lock:
+        quote_cache_snapshot = dict(latest_quote_cache)
+    return jsonify({
+        "history_report_count": len(history_report),
+        "history_report_sample": report_sample,
+        "history_status_count": len(history_status),
+        "history_status_sample": status_sample,
+        "kline_symbols": list(kline_data.keys()),
+        "quote_cache_keys": list(quote_cache_snapshot.keys()),
+        "quote_cache_sample": {k: v for k, v in list(quote_cache_snapshot.items())[:3]},
+    })
 
 @app.route("/api/latest_status", methods=["GET"])
 def api_latest_status():
