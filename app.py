@@ -320,19 +320,30 @@ def raw_store(source="mt4"):
     )
 
     # 同时写内存（保留原有展示逻辑）
-    _write_memory(category, body_json, raw_body, client_ip)
+    _write_memory(category, method, path, body_json, raw_body, client_ip)
     return parse_ok, category
 
-def _write_memory(category, body_json, raw_body, client_ip):
-    """将原始数据写入内存队列（供页面展示用）。"""
+def _write_memory(category, method, path, body_json, raw_body, client_ip):
+    """
+    将原始数据写入内存队列（供页面展示用）。
+    当 category 为 quote/report 时，还原 desc 标记，
+    确保 api_latest_status 能正确提取报价。
+    """
     record = {
         "received_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "ip":          client_ip,
-        "method":      request.method,
-        "path":        request.path,
+        "method":      method,
+        "path":        path,
         "body_raw":    raw_body,
         "parsed":      body_json,
     }
+
+    # 还原旧逻辑需要的 desc 标记，让 api_latest_status 能正常工作
+    if category in ("quote", "report") and isinstance(body_json, dict):
+        if "desc" not in body_json:
+            record["parsed"] = dict(body_json)
+            record["parsed"]["desc"] = "QUOTE_DATA"
+
     with history_lock:
         queue = _category_to_deque(category)
         if queue:
