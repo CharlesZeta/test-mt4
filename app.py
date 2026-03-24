@@ -76,31 +76,13 @@ history_lock = threading.RLock()
 
 # ==================== 产品规则表 ====================
 PRODUCT_SPECS = {
-    # 1. 外汇 (forex)
-    "EURUSD": {"size": 100000, "lev": 500, "currency": "USD", "type": "forex"},
-    "GBPUSD": {"size": 100000, "lev": 500, "currency": "USD", "type": "forex"},
-    "USDJPY": {"size": 100000, "lev": 500, "currency": "JPY", "type": "forex"},
-    "USDCHF": {"size": 100000, "lev": 500, "currency": "CHF", "type": "forex"},
-    "AUDUSD": {"size": 100000, "lev": 500, "currency": "USD", "type": "forex"},
-    "USDCAD": {"size": 100000, "lev": 500, "currency": "CAD", "type": "forex"},
-    "NZDUSD": {"size": 100000, "lev": 500, "currency": "USD", "type": "forex"},
-    "EURGBP": {"size": 100000, "lev": 500, "currency": "GBP", "type": "forex"},
-    "EURJPY": {"size": 100000, "lev": 500, "currency": "JPY", "type": "forex"},
-    "GBPJPY": {"size": 100000, "lev": 500, "currency": "JPY", "type": "forex"},
-    "AUDJPY": {"size": 100000, "lev": 500, "currency": "JPY", "type": "forex"},
-    "EURAUD": {"size": 100000, "lev": 500, "currency": "AUD", "type": "forex"},
-    "EURCHF": {"size": 100000, "lev": 500, "currency": "CHF", "type": "forex"},
-    "GBPCHF": {"size": 100000, "lev": 500, "currency": "CHF", "type": "forex"},
-    "CHFJPY": {"size": 100000, "lev": 500, "currency": "JPY", "type": "forex"},
-    "CADJPY": {"size": 100000, "lev": 500, "currency": "JPY", "type": "forex"},
-
-    # 2. 贵金属 / 原油 (metal / commodity)
+    # 1. 贵金属 / 原油
     "XAGUSD": {"size": 5000, "lev": 500, "currency": "USD", "type": "metal"},
     "XAUUSD": {"size": 100, "lev": 500, "currency": "USD", "type": "metal"},
     "UKOUSD": {"size": 1000, "lev": 500, "currency": "USD", "type": "commodity"},
     "USOUSD": {"size": 1000, "lev": 500, "currency": "USD", "type": "commodity"},
 
-    # 3. 指数 (index)
+    # 2. 指数
     "U30USD": {"size": 10, "lev": 100, "currency": "USD", "type": "index"},
     "NASUSD": {"size": 10, "lev": 100, "currency": "USD", "type": "index"},
     "SPXUSD": {"size": 100, "lev": 100, "currency": "USD", "type": "index"},
@@ -108,32 +90,21 @@ PRODUCT_SPECS = {
     "D30EUR": {"size": 10, "lev": 100, "currency": "EUR", "type": "index"},
     "E50EUR": {"size": 10, "lev": 100, "currency": "EUR", "type": "index"},
     "H33HKD": {"size": 100, "lev": 100, "currency": "HKD", "type": "index"},
-    "JPN225": {"size": 100, "lev": 100, "currency": "JPY", "type": "index"},
-    "GER40": {"size": 25, "lev": 100, "currency": "EUR", "type": "index"},
-    "FRA40": {"size": 10, "lev": 100, "currency": "EUR", "type": "index"},
-    "AUS200": {"size": 10, "lev": 100, "currency": "AUD", "type": "index"},
-    "CHI50": {"size": 1, "lev": 100, "currency": "USD", "type": "index"},
 
-    # 4. 虚拟货币 (crypto)
+    # 3. 虚拟货币
     "BTCUSD": {"size": 1, "lev": 500, "currency": "USD", "type": "crypto"},
-    "ETHUSD": {"size": 10, "lev": 500, "currency": "USD", "type": "crypto"},
-    "LTCUSD": {"size": 100, "lev": 500, "currency": "USD", "type": "crypto"},
     "BCHUSD": {"size": 100, "lev": 500, "currency": "USD", "type": "crypto"},
-    "XRPUSD": {"size": 1000, "lev": 500, "currency": "USD", "type": "crypto"},
+    "RPLUSD": {"size": 10000, "lev": 500, "currency": "USD", "type": "crypto"},
+    "LTCUSD": {"size": 100, "lev": 500, "currency": "USD", "type": "crypto"},
+    "ETHUSD": {"size": 10, "lev": 500, "currency": "USD", "type": "crypto"},
     "XMRUSD": {"size": 100, "lev": 500, "currency": "USD", "type": "crypto"},
     "BNBUSD": {"size": 100, "lev": 500, "currency": "USD", "type": "crypto"},
     "SOLUSD": {"size": 100, "lev": 500, "currency": "USD", "type": "crypto"},
-    "ADAUSD": {"size": 10000, "lev": 500, "currency": "USD", "type": "crypto"},
-    "DOGUSD": {"size": 100000, "lev": 500, "currency": "USD", "type": "crypto"},
-    "DOTUSD": {"size": 1000, "lev": 500, "currency": "USD", "type": "crypto"},
-    "AVAXUSD": {"size": 100, "lev": 500, "currency": "USD", "type": "crypto"},
-    "MATICUSD": {"size": 10000, "lev": 500, "currency": "USD", "type": "crypto"},
-    "LINKUSD": {"size": 1000, "lev": 500, "currency": "USD", "type": "crypto"},
-    "TRXUSD": {"size": 10000, "lev": 500, "currency": "USD", "type": "crypto"},
     "XSIUSD": {"size": 1000, "lev": 500, "currency": "USD", "type": "crypto"},
+    "DOGUSD": {"size": 100000, "lev": 500, "currency": "USD", "type": "crypto"},
+    "ADAUSD": {"size": 10000, "lev": 500, "currency": "USD", "type": "crypto"},
     "AVEUSD": {"size": 100, "lev": 500, "currency": "USD", "type": "crypto"},
     "DSHUSD": {"size": 1000, "lev": 500, "currency": "USD", "type": "crypto"},
-    "RPLUSD": {"size": 10000, "lev": 500, "currency": "USD", "type": "crypto"},
 }
 
 DEFAULT_FOREX_SPEC = {"size": 100000, "lev": 500, "type": "forex"}
@@ -906,10 +877,9 @@ HTML_TEMPLATE = r"""<!doctype html>
 
     <div class="tabs-wrapper">
       <div class="tabs">
-        <button class="tab" data-category="forex" onclick="switchMainTab(this); showCategoryPairs('forex')">外汇</button>
+        <button class="tab active" data-category="metal" onclick="switchMainTab(this); showCategoryPairs('metal')">贵金属</button>
         <button class="tab" data-category="index" onclick="switchMainTab(this); showCategoryPairs('index')">指数</button>
         <button class="tab" data-category="commodity" onclick="switchMainTab(this); showCategoryPairs('commodity')">大宗商品</button>
-        <button class="tab active" data-category="metal" onclick="switchMainTab(this); showCategoryPairs('metal')">贵金属</button>
         <button class="tab" data-category="crypto" onclick="switchMainTab(this); showCategoryPairs('crypto')">虚拟货币</button>
       </div>
     </div>
@@ -1000,26 +970,13 @@ HTML_TEMPLATE = r"""<!doctype html>
 
     // 产品规格
     const PRODUCT_SPECS = {
-      "EURUSD": {"size": 100000, "lev": 500, "currency": "USD", "type": "forex"},
-      "GBPUSD": {"size": 100000, "lev": 500, "currency": "USD", "type": "forex"},
-      "USDJPY": {"size": 100000, "lev": 500, "currency": "JPY", "type": "forex"},
-      "USDCHF": {"size": 100000, "lev": 500, "currency": "CHF", "type": "forex"},
-      "AUDUSD": {"size": 100000, "lev": 500, "currency": "USD", "type": "forex"},
-      "USDCAD": {"size": 100000, "lev": 500, "currency": "CAD", "type": "forex"},
-      "NZDUSD": {"size": 100000, "lev": 500, "currency": "USD", "type": "forex"},
-      "EURGBP": {"size": 100000, "lev": 500, "currency": "GBP", "type": "forex"},
-      "EURJPY": {"size": 100000, "lev": 500, "currency": "JPY", "type": "forex"},
-      "GBPJPY": {"size": 100000, "lev": 500, "currency": "JPY", "type": "forex"},
-      "AUDJPY": {"size": 100000, "lev": 500, "currency": "JPY", "type": "forex"},
-      "EURAUD": {"size": 100000, "lev": 500, "currency": "AUD", "type": "forex"},
-      "EURCHF": {"size": 100000, "lev": 500, "currency": "CHF", "type": "forex"},
-      "GBPCHF": {"size": 100000, "lev": 500, "currency": "CHF", "type": "forex"},
-      "CHFJPY": {"size": 100000, "lev": 500, "currency": "JPY", "type": "forex"},
-      "CADJPY": {"size": 100000, "lev": 500, "currency": "JPY", "type": "forex"},
+      // 1. 贵金属 / 原油
       "XAGUSD": {"size": 5000, "lev": 500, "currency": "USD", "type": "metal"},
       "XAUUSD": {"size": 100, "lev": 500, "currency": "USD", "type": "metal"},
       "UKOUSD": {"size": 1000, "lev": 500, "currency": "USD", "type": "commodity"},
       "USOUSD": {"size": 1000, "lev": 500, "currency": "USD", "type": "commodity"},
+
+      // 2. 指数
       "U30USD": {"size": 10, "lev": 100, "currency": "USD", "type": "index"},
       "NASUSD": {"size": 10, "lev": 100, "currency": "USD", "type": "index"},
       "SPXUSD": {"size": 100, "lev": 100, "currency": "USD", "type": "index"},
@@ -1027,39 +984,29 @@ HTML_TEMPLATE = r"""<!doctype html>
       "D30EUR": {"size": 10, "lev": 100, "currency": "EUR", "type": "index"},
       "E50EUR": {"size": 10, "lev": 100, "currency": "EUR", "type": "index"},
       "H33HKD": {"size": 100, "lev": 100, "currency": "HKD", "type": "index"},
-      "JPN225": {"size": 100, "lev": 100, "currency": "JPY", "type": "index"},
-      "GER40": {"size": 25, "lev": 100, "currency": "EUR", "type": "index"},
-      "FRA40": {"size": 10, "lev": 100, "currency": "EUR", "type": "index"},
-      "AUS200": {"size": 10, "lev": 100, "currency": "AUD", "type": "index"},
-      "CHI50": {"size": 1, "lev": 100, "currency": "USD", "type": "index"},
+
+      // 3. 虚拟货币
       "BTCUSD": {"size": 1, "lev": 500, "currency": "USD", "type": "crypto"},
-      "ETHUSD": {"size": 10, "lev": 500, "currency": "USD", "type": "crypto"},
-      "LTCUSD": {"size": 100, "lev": 500, "currency": "USD", "type": "crypto"},
       "BCHUSD": {"size": 100, "lev": 500, "currency": "USD", "type": "crypto"},
-      "XRPUSD": {"size": 1000, "lev": 500, "currency": "USD", "type": "crypto"},
+      "RPLUSD": {"size": 10000, "lev": 500, "currency": "USD", "type": "crypto"},
+      "LTCUSD": {"size": 100, "lev": 500, "currency": "USD", "type": "crypto"},
+      "ETHUSD": {"size": 10, "lev": 500, "currency": "USD", "type": "crypto"},
       "XMRUSD": {"size": 100, "lev": 500, "currency": "USD", "type": "crypto"},
       "BNBUSD": {"size": 100, "lev": 500, "currency": "USD", "type": "crypto"},
       "SOLUSD": {"size": 100, "lev": 500, "currency": "USD", "type": "crypto"},
-      "ADAUSD": {"size": 10000, "lev": 500, "currency": "USD", "type": "crypto"},
-      "DOGUSD": {"size": 100000, "lev": 500, "currency": "USD", "type": "crypto"},
-      "DOTUSD": {"size": 1000, "lev": 500, "currency": "USD", "type": "crypto"},
-      "AVAXUSD": {"size": 100, "lev": 500, "currency": "USD", "type": "crypto"},
-      "MATICUSD": {"size": 10000, "lev": 500, "currency": "USD", "type": "crypto"},
-      "LINKUSD": {"size": 1000, "lev": 500, "currency": "USD", "type": "crypto"},
-      "TRXUSD": {"size": 10000, "lev": 500, "currency": "USD", "type": "crypto"},
       "XSIUSD": {"size": 1000, "lev": 500, "currency": "USD", "type": "crypto"},
+      "DOGUSD": {"size": 100000, "lev": 500, "currency": "USD", "type": "crypto"},
+      "ADAUSD": {"size": 10000, "lev": 500, "currency": "USD", "type": "crypto"},
       "AVEUSD": {"size": 100, "lev": 500, "currency": "USD", "type": "crypto"},
       "DSHUSD": {"size": 1000, "lev": 500, "currency": "USD", "type": "crypto"},
-      "RPLUSD": {"size": 10000, "lev": 500, "currency": "USD", "type": "crypto"},
     };
 
     // 分类产品映射
     const CATEGORY_PAIRS = {
-      "forex": ["EURUSD", "GBPUSD", "USDJPY", "USDCHF", "AUDUSD", "USDCAD", "NZDUSD", "EURGBP", "EURJPY", "GBPJPY", "AUDJPY", "EURAUD", "EURCHF", "GBPCHF", "CHFJPY", "CADJPY"],
-      "index": ["U30USD", "NASUSD", "SPXUSD", "100GBP", "D30EUR", "E50EUR", "H33HKD", "JPN225", "GER40", "FRA40", "AUS200", "CHI50"],
+      "index": ["U30USD", "NASUSD", "SPXUSD", "100GBP", "D30EUR", "E50EUR", "H33HKD"],
       "commodity": ["UKOUSD", "USOUSD"],
       "metal": ["XAUUSD", "XAGUSD"],
-      "crypto": ["BTCUSD", "ETHUSD", "LTCUSD", "BCHUSD", "XRPUSD", "XMRUSD", "BNBUSD", "SOLUSD", "ADAUSD", "DOGUSD", "DOTUSD", "AVAXUSD", "MATICUSD", "LINKUSD", "TRXUSD", "XSIUSD", "AVEUSD", "DSHUSD", "RPLUSD"],
+      "crypto": ["BTCUSD", "ETHUSD", "LTCUSD", "BCHUSD", "XMRUSD", "BNBUSD", "SOLUSD", "ADAUSD", "DOGUSD", "XSIUSD", "AVEUSD", "DSHUSD", "RPLUSD"],
     };
 
     window.currentSymbol = "XAUUSD";
