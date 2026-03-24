@@ -33,10 +33,15 @@ def _init_pool():
     global _db_pool
     if _db_pool is not None:
         return
-    import psycopg2.pool
     url = _get_db_url()
     if not url:
-        print("[WARN] DATABASE_URL not set; running in no-persistence mode (in-process list).")
+        print("[WARN] DATABASE_URL not set; running in no-persistence mode.")
+        _db_pool = None
+        return
+    try:
+        import psycopg2.pool
+    except ImportError:
+        print("[WARN] psycopg2 not installed; running in no-persistence mode.")
         _db_pool = None
         return
     _db_pool = psycopg2.pool.ThreadedConnectionPool(
