@@ -3,8 +3,7 @@ import json
 import threading
 import traceback
 import time
-import random
-import string
+import re
 from datetime import datetime
 from collections import deque
 from flask import Flask, request, render_template_string, jsonify
@@ -13,14 +12,38 @@ app = Flask(__name__)
 
 # ==================== 全局数据结构 ====================
 MAX_HISTORY = 50
-
-# K线存储：symbol -> { "5min": [...], "10min": [...], "1hour": [...] }
-# 每根K线只保留 open/high/low/close
-# 数量限制：5min=300, 10min=250, 1hour=200，超出自动丢弃旧数据
 KLINE_MAX = {"5min": 300, "10min": 250, "1hour": 200}
+kline_data = {}
+kline_locks = {}
 
-kline_data = {}          # { symbol: { tf: [ohlc_list] } }
-kline_locks = {}         # per-symbol locks
+# ==================== 品种名归一化（核心修复） ====================
+KNOWN_SYMBOLS = set()
+
+def normalize_symbol(raw_symbol: str) -> str:
+    """
+    将 MT4 原始品种名归一化为标准名。
+    MT4 经纪商经常给品种加后缀: EURUSDm, XAUUSD.a, NASUSDc, U30USD.r 等
+    """
+    if not raw_symbol:
+        return ""
+    s = raw_symbol.strip().upper()
+    if s in KNOWN_SYMBOLS:
+        return s
+    # 去掉末尾 1~4 字符尝试匹配
+    for trim in range(1, 5):
+        candidate = s[:-trim] if len(s) > trim else ""
+        if candidate and candidate in KNOWN_SYMBOLS:
+            return candidate
+    # 去掉点号后缀
+    if '.' in s:
+        candidate = s.split('.')[0]
+        if candidate in KNOWN_SYMBOLS:
+            return candidate
+    if '_' in s:
+        candidate = s.split('_')[0]
+        if candidate in KNOWN_SYMBOLS:
+            return candidate
+    return s
 
 def get_kline_lock(symbol):
     if symbol not in kline_locks:
@@ -28,161 +51,136 @@ def get_kline_lock(symbol):
     return kline_locks[symbol]
 
 def _floor_ts(ts_ms, tf):
-    """将毫秒时间戳向下对齐到 tf 边界"""
-    if tf == "5min":
-        step = 5 * 60 * 1000
-    elif tf == "10min":
-        step = 10 * 60 * 1000
-    elif tf == "1hour":
-        step = 60 * 60 * 1000
-    else:
-        step = 60 * 1000
+    if tf == "5min":     step = 5 * 60 * 1000
+    elif tf == "10min":  step = 10 * 60 * 1000
+    elif tf == "1hour":  step = 60 * 60 * 1000
+    else:                step = 60 * 1000
     return (ts_ms // step) * step
 
 def update_kline(symbol, bid, ask, tick_ts_ms):
-    """用最新 tick 更新各周期 K 线，只保留 OHLC"""
+    """bar 格式: [ts, open, high, low, close]  索引: 0, 1, 2, 3, 4"""
     mid = (bid + ask) / 2.0
+    norm = normalize_symbol(symbol)
     tfs = ["5min", "10min", "1hour"]
-    with get_kline_lock(symbol):
-        if symbol not in kline_data:
-            kline_data[symbol] = {tf: [] for tf in tfs}
-
+    with get_kline_lock(norm):
+        if norm not in kline_data:
+            kline_data[norm] = {tf: [] for tf in tfs}
         for tf in tfs:
             bar_ts = _floor_ts(tick_ts_ms, tf)
-            bars = kline_data[symbol][tf]
-            max_len = KLINE_MAX[tf]
-
+            bars = kline_data[norm][tf]
             if bars and bars[-1][0] == bar_ts:
-                # 合并到当前 bar
                 bar = bars[-1]
-                bar[1] = max(bar[1], mid)   # high
-                bar[2] = min(bar[2], mid)   # low
-                bar[3] = mid                 # close
+                # ★ 修复: open(bar[1])不动, 只更新 high/low/close
+                bar[2] = max(bar[2], mid)   # high
+                bar[3] = min(bar[3], mid)   # low
+                bar[4] = mid                # close
             else:
-                # 新开一根 bar [ts, open, high, low, close]
                 bars.append([bar_ts, mid, mid, mid, mid])
-                # 丢弃超限旧数据
-                if len(bars) > max_len:
-                    bars[:] = bars[-max_len:]
+                if len(bars) > KLINE_MAX[tf]:
+                    bars[:] = bars[-KLINE_MAX[tf]:]
 
-# 分类别存储，避免互相污染
-history_status = deque(maxlen=MAX_HISTORY)     # /mt4/status
-history_positions = deque(maxlen=MAX_HISTORY)  # /mt4/positions
-history_report = deque(maxlen=MAX_HISTORY)     # /mt4/report
-history_poll = deque(maxlen=MAX_HISTORY)       # /mt4/commands 轮询请求（account/max）
-history_echo = deque(maxlen=MAX_HISTORY)        # /web/api/echo
-
+history_status = deque(maxlen=MAX_HISTORY)
+history_positions = deque(maxlen=MAX_HISTORY)
+history_report = deque(maxlen=MAX_HISTORY)
+history_poll = deque(maxlen=MAX_HISTORY)
+history_echo = deque(maxlen=MAX_HISTORY)
 history_lock = threading.RLock()
 
-# ==================== 产品规则表 ====================
+# ==================== 产品规则表（完整版） ====================
 PRODUCT_SPECS = {
-    # 1. 外汇 (forex)
-    "USDCHF": {"size": 100000, "lev": 500, "currency": "CHF", "type": "forex"},
-    "GBPUSD": {"size": 100000, "lev": 500, "currency": "USD", "type": "forex"},
-    "EURUSD": {"size": 100000, "lev": 500, "currency": "USD", "type": "forex"},
-    "USDJPY": {"size": 100000, "lev": 500, "currency": "JPY", "type": "forex"},
-    "USDCAD": {"size": 100000, "lev": 500, "currency": "CAD", "type": "forex"},
-    "AUDUSD": {"size": 100000, "lev": 500, "currency": "USD", "type": "forex"},
-    "EURGBP": {"size": 100000, "lev": 500, "currency": "GBP", "type": "forex"},
-    "EURAUD": {"size": 100000, "lev": 500, "currency": "AUD", "type": "forex"},
-    "EURCHF": {"size": 100000, "lev": 500, "currency": "CHF", "type": "forex"},
-    "EURJPY": {"size": 100000, "lev": 500, "currency": "JPY", "type": "forex"},
-    "GBPCHF": {"size": 100000, "lev": 500, "currency": "CHF", "type": "forex"},
-    "CADJPY": {"size": 100000, "lev": 500, "currency": "JPY", "type": "forex"},
-    "GBPJPY": {"size": 100000, "lev": 500, "currency": "JPY", "type": "forex"},
-    "AUDNZD": {"size": 100000, "lev": 500, "currency": "NZD", "type": "forex"},
-    "AUDCAD": {"size": 100000, "lev": 500, "currency": "CAD", "type": "forex"},
-    "AUDCHF": {"size": 100000, "lev": 500, "currency": "CHF", "type": "forex"},
-    "AUDJPY": {"size": 100000, "lev": 500, "currency": "JPY", "type": "forex"},
-    "CHFJPY": {"size": 100000, "lev": 500, "currency": "JPY", "type": "forex"},
-    "EURNZD": {"size": 100000, "lev": 500, "currency": "NZD", "type": "forex"},
-    "EURCAD": {"size": 100000, "lev": 500, "currency": "CAD", "type": "forex"},
-    "CADCHF": {"size": 100000, "lev": 500, "currency": "CHF", "type": "forex"},
-    "NZDJPY": {"size": 100000, "lev": 500, "currency": "JPY", "type": "forex"},
-    "NZDUSD": {"size": 100000, "lev": 500, "currency": "USD", "type": "forex"},
-    "GBPAUD": {"size": 100000, "lev": 500, "currency": "AUD", "type": "forex"},
-    "GBPCAD": {"size": 100000, "lev": 500, "currency": "CAD", "type": "forex"},
-    "GBPNZD": {"size": 100000, "lev": 500, "currency": "NZD", "type": "forex"},
-    "NZDCAD": {"size": 100000, "lev": 500, "currency": "CAD", "type": "forex"},
-    "NZDCHF": {"size": 100000, "lev": 500, "currency": "CHF", "type": "forex"},
-    "USDSGD": {"size": 100000, "lev": 500, "currency": "SGD", "type": "forex"},
-    "USDHKD": {"size": 100000, "lev": 500, "currency": "HKD", "type": "forex"},
-    "USDCNH": {"size": 100000, "lev": 500, "currency": "CNH", "type": "forex"},
-
-    # 2. 指数 (index)
-    "U30USD": {"size": 10, "lev": 100, "currency": "USD", "type": "index"},
-    "NASUSD": {"size": 10, "lev": 100, "currency": "USD", "type": "index"},
-    "SPXUSD": {"size": 100, "lev": 100, "currency": "USD", "type": "index"},
-    "100GBP": {"size": 10, "lev": 100, "currency": "GBP", "type": "index"},
-    "D30EUR": {"size": 10, "lev": 100, "currency": "EUR", "type": "index"},
-    "E50EUR": {"size": 10, "lev": 100, "currency": "EUR", "type": "index"},
-    "H33HKD": {"size": 100, "lev": 100, "currency": "HKD", "type": "index"},
-
-    # 3. 大宗商品 (commodity)
-    "UKOUSD": {"size": 1000, "lev": 500, "currency": "USD", "type": "commodity"},
-    "USOUSD": {"size": 1000, "lev": 500, "currency": "USD", "type": "commodity"},
-
-    # 4. 贵金属 (metal)
-    "XAGUSD": {"size": 5000, "lev": 500, "currency": "USD", "type": "metal"},
-    "XAUUSD": {"size": 100, "lev": 500, "currency": "USD", "type": "metal"},
-
-    # 5. 虚拟货币 (crypto)
-    "BTCUSD": {"size": 1, "lev": 500, "currency": "USD", "type": "crypto"},
-    "BCHUSD": {"size": 100, "lev": 500, "currency": "USD", "type": "crypto"},
-    "RPLUSD": {"size": 10000, "lev": 500, "currency": "USD", "type": "crypto"},
-    "LTCUSD": {"size": 100, "lev": 500, "currency": "USD", "type": "crypto"},
-    "ETHUSD": {"size": 10, "lev": 500, "currency": "USD", "type": "crypto"},
-    "XMRUSD": {"size": 100, "lev": 500, "currency": "USD", "type": "crypto"},
-    "BNBUSD": {"size": 100, "lev": 500, "currency": "USD", "type": "crypto"},
-    "SOLUSD": {"size": 100, "lev": 500, "currency": "USD", "type": "crypto"},
-    "LNKUSD": {"size": 1000, "lev": 500, "currency": "USD", "type": "crypto"},
-    "XSIUSD": {"size": 1000, "lev": 500, "currency": "USD", "type": "crypto"},
-    "DOGUSD": {"size": 100000, "lev": 500, "currency": "USD", "type": "crypto"},
-    "ADAUSD": {"size": 10000, "lev": 500, "currency": "USD", "type": "crypto"},
-    "AVEUSD": {"size": 100, "lev": 500, "currency": "USD", "type": "crypto"},
-    "DSHUSD": {"size": 1000, "lev": 500, "currency": "USD", "type": "crypto"},
-
-    # 6. 股票 (stock)
-    "AAPL":  {"size": 100, "lev": 10, "currency": "USD", "type": "stock"},
-    "AMZN":  {"size": 100, "lev": 10, "currency": "USD", "type": "stock"},
-    "BABA":  {"size": 100, "lev": 10, "currency": "USD", "type": "stock"},
-    "GOOGL": {"size": 100, "lev": 10, "currency": "USD", "type": "stock"},
-    "META":  {"size": 100, "lev": 10, "currency": "USD", "type": "stock"},
-    "MSFT":  {"size": 100, "lev": 10, "currency": "USD", "type": "stock"},
-    "NFLX":  {"size": 100, "lev": 10, "currency": "USD", "type": "stock"},
-    "NVDA":  {"size": 100, "lev": 10, "currency": "USD", "type": "stock"},
-    "TSLA":  {"size": 100, "lev": 10, "currency": "USD", "type": "stock"},
-    "ABBV":  {"size": 100, "lev": 10, "currency": "USD", "type": "stock"},
-    "ABNB":  {"size": 100, "lev": 10, "currency": "USD", "type": "stock"},
-    "ABT":   {"size": 100, "lev": 10, "currency": "USD", "type": "stock"},
-    "ADBE":  {"size": 100, "lev": 10, "currency": "USD", "type": "stock"},
-    "AMD":   {"size": 100, "lev": 10, "currency": "USD", "type": "stock"},
-    "AVGO":  {"size": 100, "lev": 10, "currency": "USD", "type": "stock"},
-    "C":     {"size": 100, "lev": 10, "currency": "USD", "type": "stock"},
-    "CRM":   {"size": 100, "lev": 10, "currency": "USD", "type": "stock"},
-    "DIS":   {"size": 100, "lev": 10, "currency": "USD", "type": "stock"},
-    "GS":    {"size": 100, "lev": 10, "currency": "USD", "type": "stock"},
-    "INTC":  {"size": 100, "lev": 10, "currency": "USD", "type": "stock"},
-    "JNJ":   {"size": 100, "lev": 10, "currency": "USD", "type": "stock"},
-    "MA":    {"size": 100, "lev": 10, "currency": "USD", "type": "stock"},
-    "MCD":   {"size": 100, "lev": 10, "currency": "USD", "type": "stock"},
-    "KO":    {"size": 100, "lev": 10, "currency": "USD", "type": "stock"},
-    "MMM":   {"size": 100, "lev": 10, "currency": "USD", "type": "stock"},
-    "NIO":   {"size": 100, "lev": 10, "currency": "USD", "type": "stock"},
-    "PLTR":  {"size": 100, "lev": 10, "currency": "USD", "type": "stock"},
-    "SHOP":  {"size": 100, "lev": 10, "currency": "USD", "type": "stock"},
-    "TSM":   {"size": 100, "lev": 10, "currency": "USD", "type": "stock"},
-    "V":     {"size": 100, "lev": 10, "currency": "USD", "type": "stock"},
+    "USDCHF":{"size":100000,"lev":500,"currency":"CHF","type":"forex"},
+    "GBPUSD":{"size":100000,"lev":500,"currency":"USD","type":"forex"},
+    "EURUSD":{"size":100000,"lev":500,"currency":"USD","type":"forex"},
+    "USDJPY":{"size":100000,"lev":500,"currency":"JPY","type":"forex"},
+    "USDCAD":{"size":100000,"lev":500,"currency":"CAD","type":"forex"},
+    "AUDUSD":{"size":100000,"lev":500,"currency":"USD","type":"forex"},
+    "EURGBP":{"size":100000,"lev":500,"currency":"GBP","type":"forex"},
+    "EURAUD":{"size":100000,"lev":500,"currency":"AUD","type":"forex"},
+    "EURCHF":{"size":100000,"lev":500,"currency":"CHF","type":"forex"},
+    "EURJPY":{"size":100000,"lev":500,"currency":"JPY","type":"forex"},
+    "GBPCHF":{"size":100000,"lev":500,"currency":"CHF","type":"forex"},
+    "CADJPY":{"size":100000,"lev":500,"currency":"JPY","type":"forex"},
+    "GBPJPY":{"size":100000,"lev":500,"currency":"JPY","type":"forex"},
+    "AUDNZD":{"size":100000,"lev":500,"currency":"NZD","type":"forex"},
+    "AUDCAD":{"size":100000,"lev":500,"currency":"CAD","type":"forex"},
+    "AUDCHF":{"size":100000,"lev":500,"currency":"CHF","type":"forex"},
+    "AUDJPY":{"size":100000,"lev":500,"currency":"JPY","type":"forex"},
+    "CHFJPY":{"size":100000,"lev":500,"currency":"JPY","type":"forex"},
+    "EURNZD":{"size":100000,"lev":500,"currency":"NZD","type":"forex"},
+    "EURCAD":{"size":100000,"lev":500,"currency":"CAD","type":"forex"},
+    "CADCHF":{"size":100000,"lev":500,"currency":"CHF","type":"forex"},
+    "NZDJPY":{"size":100000,"lev":500,"currency":"JPY","type":"forex"},
+    "NZDUSD":{"size":100000,"lev":500,"currency":"USD","type":"forex"},
+    "GBPAUD":{"size":100000,"lev":500,"currency":"AUD","type":"forex"},
+    "GBPCAD":{"size":100000,"lev":500,"currency":"CAD","type":"forex"},
+    "GBPNZD":{"size":100000,"lev":500,"currency":"NZD","type":"forex"},
+    "NZDCAD":{"size":100000,"lev":500,"currency":"CAD","type":"forex"},
+    "NZDCHF":{"size":100000,"lev":500,"currency":"CHF","type":"forex"},
+    "USDSGD":{"size":100000,"lev":500,"currency":"SGD","type":"forex"},
+    "USDHKD":{"size":100000,"lev":500,"currency":"HKD","type":"forex"},
+    "USDCNH":{"size":100000,"lev":500,"currency":"CNH","type":"forex"},
+    "U30USD":{"size":10,"lev":100,"currency":"USD","type":"index"},
+    "NASUSD":{"size":10,"lev":100,"currency":"USD","type":"index"},
+    "SPXUSD":{"size":100,"lev":100,"currency":"USD","type":"index"},
+    "100GBP":{"size":10,"lev":100,"currency":"GBP","type":"index"},
+    "D30EUR":{"size":10,"lev":100,"currency":"EUR","type":"index"},
+    "E50EUR":{"size":10,"lev":100,"currency":"EUR","type":"index"},
+    "H33HKD":{"size":100,"lev":100,"currency":"HKD","type":"index"},
+    "UKOUSD":{"size":1000,"lev":500,"currency":"USD","type":"commodity"},
+    "USOUSD":{"size":1000,"lev":500,"currency":"USD","type":"commodity"},
+    "XAGUSD":{"size":5000,"lev":500,"currency":"USD","type":"metal"},
+    "XAUUSD":{"size":100,"lev":500,"currency":"USD","type":"metal"},
+    "BTCUSD":{"size":1,"lev":500,"currency":"USD","type":"crypto"},
+    "BCHUSD":{"size":100,"lev":500,"currency":"USD","type":"crypto"},
+    "RPLUSD":{"size":10000,"lev":500,"currency":"USD","type":"crypto"},
+    "LTCUSD":{"size":100,"lev":500,"currency":"USD","type":"crypto"},
+    "ETHUSD":{"size":10,"lev":500,"currency":"USD","type":"crypto"},
+    "XMRUSD":{"size":100,"lev":500,"currency":"USD","type":"crypto"},
+    "BNBUSD":{"size":100,"lev":500,"currency":"USD","type":"crypto"},
+    "SOLUSD":{"size":100,"lev":500,"currency":"USD","type":"crypto"},
+    "LNKUSD":{"size":1000,"lev":500,"currency":"USD","type":"crypto"},
+    "XSIUSD":{"size":1000,"lev":500,"currency":"USD","type":"crypto"},
+    "DOGUSD":{"size":100000,"lev":500,"currency":"USD","type":"crypto"},
+    "ADAUSD":{"size":10000,"lev":500,"currency":"USD","type":"crypto"},
+    "AVEUSD":{"size":100,"lev":500,"currency":"USD","type":"crypto"},
+    "DSHUSD":{"size":1000,"lev":500,"currency":"USD","type":"crypto"},
+    "AAPL":{"size":100,"lev":10,"currency":"USD","type":"stock"},
+    "AMZN":{"size":100,"lev":10,"currency":"USD","type":"stock"},
+    "BABA":{"size":100,"lev":10,"currency":"USD","type":"stock"},
+    "GOOGL":{"size":100,"lev":10,"currency":"USD","type":"stock"},
+    "META":{"size":100,"lev":10,"currency":"USD","type":"stock"},
+    "MSFT":{"size":100,"lev":10,"currency":"USD","type":"stock"},
+    "NFLX":{"size":100,"lev":10,"currency":"USD","type":"stock"},
+    "NVDA":{"size":100,"lev":10,"currency":"USD","type":"stock"},
+    "TSLA":{"size":100,"lev":10,"currency":"USD","type":"stock"},
+    "ABBV":{"size":100,"lev":10,"currency":"USD","type":"stock"},
+    "ABNB":{"size":100,"lev":10,"currency":"USD","type":"stock"},
+    "ABT":{"size":100,"lev":10,"currency":"USD","type":"stock"},
+    "ADBE":{"size":100,"lev":10,"currency":"USD","type":"stock"},
+    "AMD":{"size":100,"lev":10,"currency":"USD","type":"stock"},
+    "AVGO":{"size":100,"lev":10,"currency":"USD","type":"stock"},
+    "C":{"size":100,"lev":10,"currency":"USD","type":"stock"},
+    "CRM":{"size":100,"lev":10,"currency":"USD","type":"stock"},
+    "DIS":{"size":100,"lev":10,"currency":"USD","type":"stock"},
+    "GS":{"size":100,"lev":10,"currency":"USD","type":"stock"},
+    "INTC":{"size":100,"lev":10,"currency":"USD","type":"stock"},
+    "JNJ":{"size":100,"lev":10,"currency":"USD","type":"stock"},
+    "MA":{"size":100,"lev":10,"currency":"USD","type":"stock"},
+    "MCD":{"size":100,"lev":10,"currency":"USD","type":"stock"},
+    "KO":{"size":100,"lev":10,"currency":"USD","type":"stock"},
+    "MMM":{"size":100,"lev":10,"currency":"USD","type":"stock"},
+    "NIO":{"size":100,"lev":10,"currency":"USD","type":"stock"},
+    "PLTR":{"size":100,"lev":10,"currency":"USD","type":"stock"},
+    "SHOP":{"size":100,"lev":10,"currency":"USD","type":"stock"},
+    "TSM":{"size":100,"lev":10,"currency":"USD","type":"stock"},
+    "V":{"size":100,"lev":10,"currency":"USD","type":"stock"},
 }
 
-DEFAULT_FOREX_SPEC = {"size": 100000, "lev": 500, "type": "forex"}
-DEFAULT_STOCK_SPEC = {"size": 100, "lev": 10, "currency": "USD", "type": "stock"}
+KNOWN_SYMBOLS = set(PRODUCT_SPECS.keys())
 
 # ==================== 工具函数 ====================
 def norm_str(x):
-    if x is None:
-        return ""
-    return str(x).strip()
+    return "" if x is None else str(x).strip()
 
 def get_client_ip():
     return request.headers.get('X-Real-Ip') or request.headers.get('X-Forwarded-For', request.remote_addr)
@@ -191,317 +189,194 @@ def try_parse_json(raw_body: str):
     cleaned = (raw_body or "").strip()
     if not cleaned:
         return None, None, None, None
-
-    parsed_json = None
-    parse_error = None
-    parse_error_detail = None
-    remaining_data = None
-
+    parsed_json = parse_error = parse_error_detail = remaining_data = None
     try:
         decoder = json.JSONDecoder()
         parsed_json, idx = decoder.raw_decode(cleaned)
         remaining = cleaned[idx:].strip()
         if remaining:
             remaining_data = remaining[:200]
-            print(f"[WARN] 检测到JSON后剩余数据: {remaining_data}")
     except json.JSONDecodeError as e:
         parse_error = str(e)
         parse_error_detail = traceback.format_exc()
-        print(f"[ERR] JSON解析错误: {e}")
-        print(f"[ERR] 原始body(前500字符): {cleaned[:500]}")
     except Exception as e:
         parse_error = f"未知异常: {str(e)}"
         parse_error_detail = traceback.format_exc()
-        print(f"[ERR] 解析时发生未知异常: {e}")
-
     return parsed_json, parse_error, parse_error_detail, remaining_data
 
-def detect_category(path: str, parsed_json: dict):
-    """按接口路径 + body结构判断分类"""
-    if path.endswith("/web/api/mt4/status"):
-        return "status"
-    if path.endswith("/web/api/mt4/positions"):
-        return "positions"
-    if path.endswith("/web/api/mt4/report"):
-        return "report"
-    if path.endswith("/web/api/echo"):
-        return "echo"
-    if path.endswith("/web/api/mt4/commands"):
-        return "poll"
+def detect_category(path, parsed_json):
+    if path.endswith("/web/api/mt4/status"):    return "status"
+    if path.endswith("/web/api/mt4/positions"):  return "positions"
+    if path.endswith("/web/api/mt4/report"):     return "report"
+    if path.endswith("/web/api/echo"):           return "echo"
+    if path.endswith("/web/api/mt4/commands"):   return "poll"
     return "other"
+
+def _symbol_matches(record_symbol_raw, filter_symbol):
+    """模糊匹配: EURUSDm -> EURUSD"""
+    if not filter_symbol: return True
+    if not record_symbol_raw: return False
+    return normalize_symbol(record_symbol_raw) == filter_symbol
 
 def store_mt4_data(raw_body, client_ip, headers_dict):
     parsed_json, parse_error, parse_error_detail, remaining_data = try_parse_json(raw_body)
     category = detect_category(request.path, parsed_json if isinstance(parsed_json, dict) else None)
-
     record = {
         "received_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "ip": client_ip,
-        "method": request.method,
-        "path": request.path,
-        "category": category,
-        "headers": headers_dict,
-        "body_raw": raw_body,
-        "parsed": parsed_json,
-        "parse_error": parse_error,
-        "parse_error_detail": parse_error_detail,
-        "remaining_data": remaining_data,
-        "account": parsed_json.get("account") if isinstance(parsed_json, dict) else None,
-        "server": parsed_json.get("server") if isinstance(parsed_json, dict) else None,
-        "balance": parsed_json.get("balance") if isinstance(parsed_json, dict) else None,
-        "equity": parsed_json.get("equity") if isinstance(parsed_json, dict) else None,
-        "floating_pnl": parsed_json.get("floating_pnl") if isinstance(parsed_json, dict) else None,
-        "leverage_used": parsed_json.get("leverage_used") if isinstance(parsed_json, dict) else None,
-        "risk_flags": parsed_json.get("risk_flags") if isinstance(parsed_json, dict) else None,
-        "exposure_notional": parsed_json.get("exposure_notional") if isinstance(parsed_json, dict) else None,
-        "positions": parsed_json.get("positions") if isinstance(parsed_json, dict) else None,
+        "ip": client_ip, "method": request.method, "path": request.path,
+        "category": category, "headers": headers_dict, "body_raw": raw_body,
+        "parsed": parsed_json, "parse_error": parse_error,
+        "parse_error_detail": parse_error_detail, "remaining_data": remaining_data,
     }
-
+    if isinstance(parsed_json, dict):
+        for k in ["account","server","balance","equity","floating_pnl","leverage_used","risk_flags","exposure_notional","positions"]:
+            record[k] = parsed_json.get(k)
     with history_lock:
-        if category == "status":
-            history_status.appendleft(record)
-        elif category == "positions":
-            history_positions.appendleft(record)
-        elif category == "report":
-            history_report.appendleft(record)
-        elif category == "poll":
-            history_poll.appendleft(record)
-        elif category == "echo":
-            history_echo.appendleft(record)
-
+        {"status":history_status,"positions":history_positions,"report":history_report,
+         "poll":history_poll,"echo":history_echo}.get(category, history_echo).appendleft(record)
     return parsed_json, record
+
+# ==================== 调试接口 ====================
+@app.route("/api/debug/symbols", methods=["GET"])
+def api_debug_symbols():
+    """查看 MT4 推送的原始品种名 vs 归一化后的名字，调试匹配问题"""
+    raw_syms = {}
+    with history_lock:
+        for r in history_report:
+            p = r.get("parsed")
+            if isinstance(p, dict) and p.get("symbol"):
+                raw = p["symbol"]
+                raw_syms[raw] = normalize_symbol(raw)
+    return jsonify({"raw_to_normalized": raw_syms, "known_count": len(KNOWN_SYMBOLS)})
 
 # ==================== 最新状态接口 ====================
 @app.route("/api/latest_status", methods=["GET"])
 def api_latest_status():
-    symbol_filter = request.args.get("symbol", "").upper()
-
-    detail = None
-    latest_quote = None
-
+    sf = request.args.get("symbol", "").upper()
+    detail = latest_quote = None
     with history_lock:
-        latest_status_record = history_status[0] if history_status else None
-        latest_positions_record = history_positions[0] if history_positions else None
+        sr = history_status[0] if history_status else None
+        pr = history_positions[0] if history_positions else None
 
-        # 优先：从 /api/tick 推送的数据（desc=QUOTE_DATA，直接有 symbol 和 bid/ask）
         for record in history_report:
-            parsed = record.get("parsed")
-            if not isinstance(parsed, dict):
-                continue
-            if parsed.get("desc") == "QUOTE_DATA":
-                record_symbol = parsed.get("symbol", "")
-                if symbol_filter and record_symbol and record_symbol != symbol_filter:
-                    continue
+            p = record.get("parsed")
+            if not isinstance(p, dict): continue
+            if p.get("desc") == "QUOTE_DATA":
+                rs = p.get("symbol", "")
+                if sf and not _symbol_matches(rs, sf): continue
                 try:
-                    msg = parsed.get("message", "{}")
-                    quote_data = json.loads(msg)
-                    if isinstance(quote_data, dict) and "bid" in quote_data:
-                        latest_quote = {
-                            "bid": quote_data.get("bid"),
-                            "ask": quote_data.get("ask"),
-                            "symbol": record_symbol,
-                            "spread": parsed.get("spread"),
-                            "ts": parsed.get("ts"),
-                            "received_at": record.get("received_at"),
-                        }
+                    qd = json.loads(p.get("message", "{}"))
+                    if isinstance(qd, dict) and "bid" in qd:
+                        latest_quote = {"bid":qd["bid"],"ask":qd["ask"],
+                            "symbol":normalize_symbol(rs) or rs,
+                            "spread":p.get("spread"),"ts":p.get("ts"),
+                            "received_at":record.get("received_at")}
                         break
-                except (json.JSONDecodeError, TypeError):
-                    pass
+                except: pass
 
-        # 兜底：直接从 history_report 找任意带 bid/ask 的记录（MT4 quote/report 推送）
-        if latest_quote is None:
+        if not latest_quote:
             for record in history_report:
-                parsed = record.get("parsed")
-                if not isinstance(parsed, dict):
-                    continue
-                record_symbol = parsed.get("symbol", "")
-                if symbol_filter and record_symbol and record_symbol != symbol_filter:
-                    continue
-                bid = parsed.get("bid")
-                ask = parsed.get("ask")
-                if bid is not None and ask is not None:
-                    latest_quote = {
-                        "bid": bid,
-                        "ask": ask,
-                        "symbol": record_symbol,
-                        "spread": parsed.get("spread"),
-                        "ts": parsed.get("ts"),
-                        "received_at": record.get("received_at"),
-                    }
+                p = record.get("parsed")
+                if not isinstance(p, dict): continue
+                rs = p.get("symbol", "")
+                if sf and not _symbol_matches(rs, sf): continue
+                if p.get("bid") is not None and p.get("ask") is not None:
+                    latest_quote = {"bid":p["bid"],"ask":p["ask"],
+                        "symbol":normalize_symbol(rs) or rs,
+                        "spread":p.get("spread"),"ts":p.get("ts"),
+                        "received_at":record.get("received_at")}
                     break
 
-        # 兜底：从 MT4 status 的 positions 里尝试找对应品种的持仓均价作为参考
-        if latest_quote is None and latest_status_record:
-            parsed = latest_status_record.get("parsed", {})
-            if symbol_filter:
-                positions = parsed.get("positions") or []
-                for pos in positions:
-                    pos_symbol = norm_str(pos.get("symbol", ""))
-                    if pos_symbol == symbol_filter:
-                        latest_quote = {
-                            "bid": None,
-                            "ask": None,
-                            "symbol": symbol_filter,
-                            "spread": None,
-                            "ts": None,
-                            "received_at": latest_status_record.get("received_at"),
-                        }
+        if not latest_quote and sr:
+            pd = sr.get("parsed", {})
+            if sf:
+                for pos in (pd.get("positions") or []):
+                    if _symbol_matches(norm_str(pos.get("symbol","")), sf):
+                        latest_quote = {"bid":None,"ask":None,"symbol":sf,
+                            "spread":None,"ts":None,"received_at":sr.get("received_at")}
                         break
 
-        if latest_status_record:
-            parsed = latest_status_record.get("parsed", {})
-            detail = {
-                "received_at": latest_status_record.get("received_at"),
-                "account": parsed.get("account"),
-                "server": parsed.get("server"),
-                "balance": parsed.get("balance"),
-                "equity": parsed.get("equity"),
-                "margin": parsed.get("margin"),
-                "free_margin": parsed.get("free_margin"),
-                "margin_level": parsed.get("margin_level"),
-                "floating_pnl": parsed.get("floating_pnl"),
-                "leverage_used": parsed.get("leverage_used"),
-                "positions": parsed.get("positions") or (latest_positions_record.get("parsed", {}).get("positions") if latest_positions_record else []),
-            }
-        elif latest_positions_record:
-            parsed = latest_positions_record.get("parsed", {})
-            detail = {
-                "received_at": latest_positions_record.get("received_at"),
-                "account": parsed.get("account"),
-                "server": parsed.get("server"),
-                "balance": None,
-                "equity": None,
-                "margin": None,
-                "free_margin": None,
-                "margin_level": None,
-                "floating_pnl": None,
-                "leverage_used": None,
-                "positions": parsed.get("positions") or [],
-            }
+        if sr:
+            pd = sr.get("parsed", {})
+            detail = {k: pd.get(k) for k in ["account","server","balance","equity","margin","free_margin","margin_level","floating_pnl","leverage_used"]}
+            detail["received_at"] = sr.get("received_at")
+            detail["positions"] = pd.get("positions") or (pr.get("parsed",{}).get("positions") if pr else [])
+        elif pr:
+            pd = pr.get("parsed", {})
+            detail = {"received_at":pr.get("received_at"),"account":pd.get("account"),"server":pd.get("server"),
+                "positions":pd.get("positions") or []}
 
-    return jsonify({
-        "detail": detail,
-        "latest_quote": latest_quote,
-    })
+    return jsonify({"detail":detail,"latest_quote":latest_quote})
 
-# ==================== MT4 数据接收接口 ====================
+# ==================== MT4 数据接收 ====================
 @app.route("/web/api/mt4/status", methods=["POST"])
 def mt4_status():
-    raw_body = request.get_data(as_text=True)
-    client_ip = get_client_ip()
-    headers_dict = dict(request.headers)
-    _, _ = store_mt4_data(raw_body, client_ip, headers_dict)
+    store_mt4_data(request.get_data(as_text=True), get_client_ip(), dict(request.headers))
     return "OK", 200
 
 @app.route("/web/api/mt4/positions", methods=["POST"])
 def mt4_positions():
-    raw_body = request.get_data(as_text=True)
-    client_ip = get_client_ip()
-    headers_dict = dict(request.headers)
-    store_mt4_data(raw_body, client_ip, headers_dict)
+    store_mt4_data(request.get_data(as_text=True), get_client_ip(), dict(request.headers))
     return "OK", 200
 
 @app.route("/web/api/mt4/report", methods=["POST"])
 def mt4_report():
-    raw_body = request.get_data(as_text=True)
-    client_ip = get_client_ip()
-    headers_dict = dict(request.headers)
-    store_mt4_data(raw_body, client_ip, headers_dict)
+    store_mt4_data(request.get_data(as_text=True), get_client_ip(), dict(request.headers))
     return "OK", 200
 
 @app.route("/web/api/mt4/quote", methods=["POST"])
 def mt4_quote():
-    raw_body = request.get_data(as_text=True)
-    client_ip = get_client_ip()
-    headers_dict = dict(request.headers)
-    store_mt4_data(raw_body, client_ip, headers_dict)
+    store_mt4_data(request.get_data(as_text=True), get_client_ip(), dict(request.headers))
     return "OK", 200
 
 @app.route("/web/api/echo", methods=["POST"])
 def mt4_webhook_echo():
-    raw_body = request.get_data(as_text=True)
-    client_ip = get_client_ip()
-    headers_dict = dict(request.headers)
-    store_mt4_data(raw_body, client_ip, headers_dict)
+    store_mt4_data(request.get_data(as_text=True), get_client_ip(), dict(request.headers))
     return "OK", 200
 
 @app.route("/web/api/mt4/commands", methods=["POST"])
 def mt4_commands():
-    raw_body = request.get_data(as_text=True)
-    client_ip = get_client_ip()
-    headers_dict = dict(request.headers)
-    store_mt4_data(raw_body, client_ip, headers_dict)
+    store_mt4_data(request.get_data(as_text=True), get_client_ip(), dict(request.headers))
     return jsonify({"commands": []}), 200
 
-# ==================== Tick 推送接口 ====================
+# ==================== Tick 推送 ====================
 @app.route('/api/tick', methods=['POST'])
 def receive_tick():
     try:
         ticks = request.json
-        if not isinstance(ticks, list):
-            ticks = [ticks]
-
+        if not isinstance(ticks, list): ticks = [ticks]
         for tick in ticks:
-            symbol = tick.get('symbol')
-            bid = tick.get('bid')
-            ask = tick.get('ask')
-            tick_time = tick.get('tick_time')
-
-            if not symbol or not bid or not ask:
-                continue
-
-            # 更新K线
-            tick_ts_ms = (tick_time * 1000) if tick_time else int(time.time() * 1000)
-            update_kline(symbol, float(bid), float(ask), tick_ts_ms)
-
-            quote_msg = json.dumps({
-                "bid": bid,
-                "ask": ask
-            })
-
+            sym_raw = tick.get('symbol')
+            bid, ask = tick.get('bid'), tick.get('ask')
+            tt = tick.get('tick_time')
+            if not sym_raw or not bid or not ask: continue
+            ts_ms = (tt * 1000) if tt else int(time.time() * 1000)
+            update_kline(sym_raw, float(bid), float(ask), ts_ms)
             record = {
                 "received_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                "ip": get_client_ip(),
-                "method": "POST",
-                "path": "/api/tick",
-                "category": "report",
-                "headers": {},
-                "body_raw": json.dumps(tick),
-                "parsed": {
-                    "desc": "QUOTE_DATA",
-                    "spread": tick.get('spread', 0),
-                    "ts": tick_time,
-                    "message": quote_msg,
-                    "symbol": symbol,
-                    "account": "tick_stream"
-                }
+                "ip": get_client_ip(), "method": "POST", "path": "/api/tick",
+                "category": "report", "headers": {}, "body_raw": json.dumps(tick),
+                "parsed": {"desc":"QUOTE_DATA","spread":tick.get('spread',0),"ts":tt,
+                    "message":json.dumps({"bid":bid,"ask":ask}),
+                    "symbol":sym_raw,"account":"tick_stream"}
             }
-
             with history_lock:
                 history_report.appendleft(record)
-
         return '', 204
-
     except Exception as e:
-        print(f"Error processing tick: {e}")
         return jsonify({'error': str(e)}), 500
 
-# ==================== K线数据接口 ====================
+# ==================== K线 & 产品接口 ====================
 @app.route("/api/kline", methods=["GET"])
 def api_kline():
     symbol = request.args.get("symbol", "XAUUSD").upper()
     tf = request.args.get("tf", "5min")
-    if tf not in KLINE_MAX:
-        tf = "5min"
-
-    limit = request.args.get("limit", KLINE_MAX[tf], type=int)
-    limit = min(limit, KLINE_MAX[tf])
-
+    if tf not in KLINE_MAX: tf = "5min"
+    limit = min(request.args.get("limit", KLINE_MAX[tf], type=int), KLINE_MAX[tf])
     with get_kline_lock(symbol):
         bars = list(kline_data.get(symbol, {}).get(tf, []))
-    return jsonify({"symbol": symbol, "tf": tf, "bars": bars[-limit:]})
+    return jsonify({"symbol":symbol,"tf":tf,"bars":bars[-limit:]})
 
-# ==================== 产品规格接口 ====================
 @app.route("/api/products", methods=["GET"])
 def api_products():
     return jsonify(PRODUCT_SPECS)
@@ -510,1043 +385,334 @@ def api_products():
 HTML_TEMPLATE = r"""<!doctype html>
 <html lang="zh-CN">
 <head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
-  <meta name="apple-mobile-web-app-capable" content="yes" />
-  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
-  <meta name="format-detection" content="telephone=no" />
-  <meta name="theme-color" content="#ffffff" />
-
-  <title>量化交易终端 - 移动版</title>
-  <style>
-    :root {
-      --bg: #f5f7fa;
-      --card: #ffffff;
-      --text: #1a1e23;
-      --muted: #848e9c;
-      --line: #eaecef;
-      --green: #0ecb81;
-      --red: #f6465d;
-      --yellow: #f0b90b;
-      --chip: #f3f5f7;
-      --shadow: 0 0.5rem 1.5rem rgba(0,0,0,0.06);
-      --radius: 1rem;
-      --safe-bottom: env(safe-area-inset-bottom);
-    }
-
-    * {
-      box-sizing: border-box;
-      -webkit-tap-highlight-color: transparent;
-      outline: none;
-    }
-
-    html {
-      font-size: 16px;
-      -webkit-text-size-adjust: 100%;
-    }
-
-    body {
-      margin: 0;
-      font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Helvetica Neue", sans-serif;
-      color: var(--text);
-      background: var(--bg);
-      line-height: 1.5;
-      overflow-x: hidden;
-      width: 100%;
-      overscroll-behavior-y: none;
-    }
-
-    button, a, input, [role="button"] {
-      touch-action: manipulation;
-    }
-
-    .app {
-      width: 100%;
-      max-width: 62.5rem;
-      margin: 0 auto;
-      min-height: 100vh;
-      padding: 1.25rem;
-      padding-bottom: calc(1.25rem + var(--safe-bottom));
-    }
-
-    /* 顶部 */
-    .topbar { display: flex; align-items: center; justify-content: space-between; margin-bottom: 1.25rem; }
-    .title { font-size: 1.375rem; font-weight: 800; }
-    .conn-status {
-      display: flex;
-      align-items: center;
-      gap: 0.5rem;
-      font-size: 0.875rem;
-      font-weight: 600;
-      color: var(--muted);
-    }
-    .conn-dot {
-      width: 0.5rem;
-      height: 0.5rem;
-      border-radius: 50%;
-      background: #ccc;
-      transition: background 0.3s;
-    }
-    .conn-dot.active { background: var(--green); box-shadow: 0 0 6px var(--green); }
-    .conn-dot.warning { background: var(--yellow); box-shadow: 0 0 6px var(--yellow); }
-    .conn-dot.error { background: var(--red); box-shadow: 0 0 6px var(--red); }
-
-    /* 顶部分类 Tabs */
-    .tabs-wrapper {
-      overflow-x: auto;
-      white-space: nowrap;
-      margin-bottom: 1.25rem;
-      -webkit-overflow-scrolling: touch;
-      padding-bottom: 0.3125rem;
-      scrollbar-width: none;
-    }
-    .tabs-wrapper::-webkit-scrollbar { display: none; }
-
-    .tabs { display: inline-flex; gap: 0.5rem; }
-    .tab {
-      padding: 0.5rem 1rem;
-      border-radius: 0.5rem;
-      background: transparent;
-      color: var(--muted);
-      font-weight: 700;
-      border: none;
-      font-size: 0.9375rem;
-      min-height: 2.75rem;
-      transition: 0.2s;
-      cursor: pointer;
-    }
-    .tab.active { background: var(--card); color: var(--text); box-shadow: 0 2px 8px rgba(0,0,0,0.05); }
-
-    /* 品种行情行 */
-    .symRow {
-      display: grid;
-      grid-template-columns: 1fr auto 1fr;
-      align-items: center;
-      margin-bottom: 1.25rem;
-      background: var(--card);
-      padding: 1.25rem;
-      border-radius: var(--radius);
-      box-shadow: var(--shadow);
-      border: 1px solid var(--line);
-    }
-    .symLeftTime {
-      font-family: monospace;
-      font-weight: 700;
-      color: var(--muted);
-      font-size: 1.75rem;
-      justify-self: start;
-    }
-    .symCenter { display: flex; flex-direction: column; align-items: center; justify-self: center; gap: 0.25rem; }
-    .symName { display: flex; align-items: center; gap: 0.625rem; font-size: 1.625rem; font-weight: 800; }
-    .symBadge {
-      font-size: 0.875rem;
-      padding: 0.25rem 0.5rem;
-      border-radius: 0.375rem;
-      background: var(--text);
-      color: #fff;
-      font-weight: 700;
-      min-height: 2rem;
-      display: inline-flex;
-      align-items: center;
-      cursor: pointer;
-    }
-    .symRight { display: flex; align-items: center; justify-self: end; }
-    .iconBtn.huge-chart {
-      width: 5rem;
-      height: 5rem;
-      border-radius: 1rem;
-      border: 2px solid var(--line);
-      background: #fff;
-      display: grid;
-      place-items: center;
-      font-size: 2.25rem;
-      box-shadow: 0 4px 12px rgba(0,0,0,0.05);
-      transition: 0.2s;
-      cursor: pointer;
-    }
-    .iconBtn.huge-chart:active { transform: scale(0.95); }
-
-    /* 价格展示区域 */
-    .price-card {
-      background: var(--card);
-      border: 1px solid var(--line);
-      border-radius: var(--radius);
-      box-shadow: var(--shadow);
-      padding: 1.5rem;
-      margin-bottom: 1.25rem;
-    }
-
-    .price-main {
-      text-align: center;
-      margin-bottom: 1.5rem;
-    }
-    .price-value {
-      font-size: 2.5rem;
-      font-weight: 800;
-      letter-spacing: -1px;
-      color: var(--text);
-    }
-    .price-suffix {
-      font-size: 1rem;
-      font-weight: 600;
-      color: var(--muted);
-      margin-left: 0.25rem;
-    }
-
-    .price-detail {
-      display: grid;
-      grid-template-columns: 1fr 1fr 1fr;
-      gap: 1rem;
-      text-align: center;
-    }
-    .price-item {
-      display: flex;
-      flex-direction: column;
-      gap: 0.25rem;
-    }
-    .price-item-label {
-      font-size: 0.875rem;
-      font-weight: 600;
-      color: var(--muted);
-    }
-    .price-item-value {
-      font-size: 1.25rem;
-      font-weight: 800;
-      font-family: monospace;
-    }
-    .price-item-value.bid { color: var(--green); }
-    .price-item-value.ask { color: var(--red); }
-    .price-item-value.spread { color: var(--text); }
-
-    /* 数据延迟检验 */
-    .status-bar {
-      background: var(--card);
-      border: 1px solid var(--line);
-      border-radius: var(--radius);
-      box-shadow: var(--shadow);
-      padding: 1rem 1.5rem;
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      margin-bottom: 1.25rem;
-    }
-    .status-item {
-      display: flex;
-      align-items: center;
-      gap: 0.5rem;
-      font-size: 0.875rem;
-      font-weight: 600;
-      color: var(--muted);
-    }
-    .signal-dot {
-      width: 0.625rem;
-      height: 0.625rem;
-      border-radius: 50%;
-      display: inline-block;
-      transition: background 0.3s;
-    }
-    .signal-dot.green { background: var(--green); box-shadow: 0 0 6px var(--green); }
-    .signal-dot.yellow { background: var(--yellow); box-shadow: 0 0 6px var(--yellow); }
-    .signal-dot.red { background: var(--red); box-shadow: 0 0 6px var(--red); }
-
-    /* 账户信息 */
-    .account-card {
-      background: var(--card);
-      border: 1px solid var(--line);
-      border-radius: var(--radius);
-      box-shadow: var(--shadow);
-      padding: 1.5rem;
-    }
-    .account-title {
-      font-size: 0.875rem;
-      font-weight: 700;
-      color: var(--muted);
-      margin-bottom: 1rem;
-    }
-    .account-grid {
-      display: grid;
-      grid-template-columns: repeat(2, 1fr);
-      gap: 1rem;
-    }
-    .account-item {
-      display: flex;
-      flex-direction: column;
-      gap: 0.25rem;
-    }
-    .account-label {
-      font-size: 0.875rem;
-      font-weight: 600;
-      color: var(--muted);
-    }
-    .account-value {
-      font-weight: 800;
-      font-size: 1rem;
-      font-family: monospace;
-    }
-
-    /* 弹窗 */
-    .modalMask {
-      position: fixed;
-      inset: 0;
-      background: rgba(0,0,0,.5);
-      display: none;
-      align-items: center;
-      justify-content: center;
-      padding: 1.25rem;
-      z-index: 100;
-      backdrop-filter: blur(2px);
-    }
-    .modal {
-      width: min(27.5rem, 100%);
-      background: #fff;
-      border-radius: 1.25rem;
-      overflow: hidden;
-      box-shadow: 0 1.25rem 2.5rem rgba(0,0,0,0.1);
-      animation: pop 0.2s ease-out;
-      display: flex;
-      flex-direction: column;
-      max-height: 90vh;
-    }
-    @keyframes pop { from { transform: scale(0.95); opacity: 0; } to { transform: scale(1); opacity: 1; } }
-
-    .modalHeader {
-      padding: 1.25rem;
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      border-bottom: 1px solid var(--line);
-      font-weight: 800;
-      font-size: 1.125rem;
-      flex-shrink: 0;
-      min-height: 3.5rem;
-    }
-    .modalBody { padding: 1.25rem; overflow-y: auto; flex-grow: 1; }
-    .select-item {
-      padding: 1rem;
-      border-bottom: 1px solid var(--line);
-      font-weight: 700;
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      min-height: 3.5rem;
-      cursor: pointer;
-    }
-    .select-item:last-child { border-bottom: none; }
-    .select-item:active { background: var(--chip); }
-    .select-item.active { color: var(--text); }
-
-    /* 响应式 */
-    @media (max-width: 768px) {
-      .app { padding: 1rem; padding-bottom: calc(1rem + var(--safe-bottom)); }
-      .symLeftTime { font-size: 1.5rem; }
-      .symName { font-size: 1.375rem; }
-      .price-value { font-size: 2rem; }
-      .symBidAsk { font-size: 1rem; }
-      .mainContent { display: flex; flex-direction: column; gap: 1rem; }
-      .chart-panel { height: 320px; }
-      .modalMask { align-items: flex-end; padding: 0; }
-      .modal {
-        width: 100%;
-        max-width: 100%;
-        border-radius: 1.5rem 1.5rem 0 0;
-        margin: 0;
-        animation: slideUp 0.3s cubic-bezier(0.16, 1, 0.3, 1);
-        padding-bottom: var(--safe-bottom);
-      }
-      @keyframes slideUp { from { transform: translateY(100%); } to { transform: translateY(0); } }
-    }
-
-    /* ===== 新增样式 ===== */
-    .mainContent {
-      display: grid;
-      grid-template-columns: 340px 1fr;
-      gap: 1rem;
-      margin-bottom: 1rem;
-    }
-
-    .symBidAsk {
-      display: flex;
-      flex-direction: column;
-      align-items: flex-end;
-      gap: 0.25rem;
-      font-size: 1.125rem;
-      font-weight: 800;
-      font-family: monospace;
-      min-width: 5rem;
-    }
-    .sba-bid { color: var(--green); }
-    .sba-ask { color: var(--red); }
-    .sba-sep { color: var(--muted); font-size: 0.875rem; }
-
-    /* K线图 */
-    .chart-panel {
-      background: var(--card);
-      border: 1px solid var(--line);
-      border-radius: var(--radius);
-      box-shadow: var(--shadow);
-      display: flex;
-      flex-direction: column;
-      overflow: hidden;
-      min-height: 300px;
-    }
-    .chart-header {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      padding: 0.75rem 1rem;
-      border-bottom: 1px solid var(--line);
-      flex-shrink: 0;
-    }
-    .chart-title {
-      font-size: 0.875rem;
-      font-weight: 800;
-      color: var(--muted);
-    }
-    .tf-tabs { display: flex; gap: 0.25rem; }
-    .tf-tab {
-      padding: 0.25rem 0.75rem;
-      border-radius: 0.375rem;
-      border: 1px solid var(--line);
-      background: transparent;
-      color: var(--muted);
-      font-weight: 700;
-      font-size: 0.8125rem;
-      cursor: pointer;
-      transition: 0.15s;
-    }
-    .tf-tab.active {
-      background: var(--text);
-      color: #fff;
-      border-color: var(--text);
-    }
-    .chart-wrap {
-      flex: 1;
-      position: relative;
-      min-height: 0;
-    }
-    #klineCanvas {
-      position: absolute;
-      inset: 0;
-      width: 100%;
-      height: 100%;
-    }
-  </style>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover"/>
+<meta name="apple-mobile-web-app-capable" content="yes"/>
+<meta name="theme-color" content="#0b0e11"/>
+<title>量化交易终端</title>
+<style>
+:root{--bg:#0b0e11;--card:#161a1e;--card2:#1e2329;--text:#eaecef;--muted:#5e6673;
+--line:#2b3139;--green:#0ecb81;--red:#f6465d;--yellow:#f0b90b;--accent:#f0b90b;
+--safe-b:env(safe-area-inset-bottom)}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent;outline:none}
+html{font-size:16px}body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC",sans-serif;
+color:var(--text);background:var(--bg);line-height:1.5;overflow-x:hidden}
+.app{width:100%;max-width:72rem;margin:0 auto;min-height:100vh;padding:1rem;
+padding-bottom:calc(1rem + var(--safe-b))}
+.topbar{display:flex;align-items:center;justify-content:space-between;margin-bottom:.75rem}
+.logo{font-size:1.125rem;font-weight:700;color:var(--accent)}
+.conn{display:flex;align-items:center;gap:.4rem;font-size:.8rem;font-weight:600;color:var(--muted)}
+.dot{width:.5rem;height:.5rem;border-radius:50%;background:#555;transition:.3s}
+.dot.ok{background:var(--green);box-shadow:0 0 6px var(--green)}
+.dot.err{background:var(--red);box-shadow:0 0 6px var(--red)}
+.tw{overflow-x:auto;white-space:nowrap;margin-bottom:.75rem;scrollbar-width:none;-webkit-overflow-scrolling:touch}
+.tw::-webkit-scrollbar{display:none}
+.tabs{display:inline-flex;gap:.375rem}
+.tab{padding:.4rem .875rem;border-radius:.375rem;background:0;color:var(--muted);font-weight:600;
+border:1px solid transparent;font-size:.8rem;cursor:pointer;transition:.2s}
+.tab:hover{color:var(--text)}.tab.on{background:var(--card2);color:var(--accent);border-color:var(--line)}
+.sr{display:flex;align-items:center;justify-content:space-between;margin-bottom:.75rem;
+background:var(--card);padding:.875rem 1.25rem;border-radius:.75rem;border:1px solid var(--line)}
+.clk{font-family:"SF Mono",Menlo,monospace;font-weight:700;color:var(--muted);font-size:1.25rem}
+.sc{display:flex;align-items:center;gap:.75rem}
+.sn{font-size:1.375rem;font-weight:800;letter-spacing:.5px}
+.sb{font-size:.75rem;padding:.25rem .625rem;border-radius:.25rem;background:var(--card2);
+color:var(--muted);font-weight:600;border:1px solid var(--line);cursor:pointer;transition:.15s}
+.sb:hover{color:var(--accent);border-color:var(--accent)}
+.ba{display:flex;align-items:center;gap:.75rem;font-family:"SF Mono",monospace;font-weight:700;font-size:1rem}
+.ba-b{color:var(--green)}.ba-a{color:var(--red)}.ba-s{color:var(--muted);font-size:.75rem}
+.main{display:grid;grid-template-columns:280px 1fr;gap:.75rem;margin-bottom:.75rem}
+.pc{background:var(--card);border:1px solid var(--line);border-radius:.75rem;padding:1.25rem;
+display:flex;flex-direction:column;gap:1rem}
+.pm{text-align:center}
+.pv{font-size:2.25rem;font-weight:800;letter-spacing:-.5px;font-family:"SF Mono",monospace;transition:color .2s}
+.pv.up{color:var(--green)}.pv.down{color:var(--red)}
+.pr{display:flex;justify-content:space-between;align-items:center;padding:.4rem 0;border-bottom:1px solid var(--line)}
+.pr:last-child{border-bottom:0}
+.pl{font-size:.8rem;font-weight:600;color:var(--muted)}
+.pvv{font-size:1rem;font-weight:700;font-family:"SF Mono",monospace}
+.pvv.bid{color:var(--green)}.pvv.ask{color:var(--red)}
+.cp{background:var(--card);border:1px solid var(--line);border-radius:.75rem;display:flex;
+flex-direction:column;overflow:hidden;min-height:380px}
+.ch{display:flex;align-items:center;justify-content:space-between;padding:.625rem 1rem;
+border-bottom:1px solid var(--line);flex-shrink:0}
+.ct{font-size:.8rem;font-weight:700;color:var(--muted)}
+.ci{font-size:.75rem;color:var(--muted);font-family:monospace}
+.tft{display:flex;gap:.25rem}
+.tf{padding:.2rem .625rem;border-radius:.25rem;border:1px solid var(--line);background:0;
+color:var(--muted);font-weight:600;font-size:.75rem;cursor:pointer;transition:.15s}
+.tf:hover{color:var(--text)}.tf.on{background:var(--accent);color:#000;border-color:var(--accent)}
+.cw{flex:1;position:relative;min-height:0;cursor:crosshair}
+#kc,#cc{position:absolute;inset:0;width:100%;height:100%}#cc{pointer-events:none}
+.stb{background:var(--card);border:1px solid var(--line);border-radius:.75rem;padding:.625rem 1rem;
+display:flex;justify-content:space-between;align-items:center}
+.si{display:flex;align-items:center;gap:.375rem;font-size:.75rem;font-weight:600;color:var(--muted)}
+.sg{width:.5rem;height:.5rem;border-radius:50%;display:inline-block}
+.sg.g{background:var(--green);box-shadow:0 0 4px var(--green)}
+.sg.y{background:var(--yellow);box-shadow:0 0 4px var(--yellow)}
+.sg.r{background:var(--red);box-shadow:0 0 4px var(--red)}
+.mask{position:fixed;inset:0;background:rgba(0,0,0,.65);display:none;align-items:center;
+justify-content:center;padding:1rem;z-index:100;backdrop-filter:blur(4px)}
+.mdl{width:min(24rem,100%);background:var(--card);border-radius:1rem;overflow:hidden;
+border:1px solid var(--line);box-shadow:0 20px 40px rgba(0,0,0,.4);animation:pop .2s ease-out;
+display:flex;flex-direction:column;max-height:80vh}
+@keyframes pop{from{transform:scale(.95);opacity:0}to{transform:scale(1);opacity:1}}
+.mh{padding:1rem 1.25rem;display:flex;justify-content:space-between;align-items:center;
+border-bottom:1px solid var(--line);font-weight:700;font-size:1rem;flex-shrink:0}
+.mb{padding:.5rem;overflow-y:auto;flex-grow:1}
+.it{padding:.75rem 1rem;font-weight:600;display:flex;justify-content:space-between;
+align-items:center;border-radius:.5rem;cursor:pointer;transition:.1s;color:var(--muted)}
+.it:hover{background:var(--card2);color:var(--text)}.it.on{color:var(--accent)}
+.xb{background:0;border:0;color:var(--muted);font-size:1.25rem;cursor:pointer}
+@media(max-width:768px){
+.main{grid-template-columns:1fr}.cp{min-height:320px}
+.sr{flex-wrap:wrap;gap:.5rem}
+.mask{align-items:flex-end;padding:0}
+.mdl{width:100%;border-radius:1rem 1rem 0 0;animation:sU .25s ease-out;padding-bottom:var(--safe-b)}
+@keyframes sU{from{transform:translateY(100%)}to{transform:translateY(0)}}
+}
+</style>
 </head>
 <body>
+<div class="app">
+<div class="topbar"><div class="logo">MT4 量化终端</div>
+<div class="conn"><span id="cT">等待连接...</span><span class="dot" id="cD"></span></div></div>
 
-  <div class="app">
-    <div class="topbar">
-      <div class="title">MT4 量化终端</div>
-      <div class="conn-status">
-        <span id="connText">等待连接...</span>
-        <span class="conn-dot" id="connDot"></span>
-      </div>
-    </div>
+<div class="tw"><div class="tabs">
+<button class="tab on" onclick="stab(this,'forex')">外汇</button>
+<button class="tab" onclick="stab(this,'metal')">贵金属</button>
+<button class="tab" onclick="stab(this,'commodity')">大宗商品</button>
+<button class="tab" onclick="stab(this,'index')">指数</button>
+<button class="tab" onclick="stab(this,'crypto')">虚拟货币</button>
+<button class="tab" onclick="stab(this,'stock')">股票</button>
+</div></div>
 
-    <div class="tabs-wrapper">
-      <div class="tabs">
-        <button class="tab active" data-category="forex" onclick="switchMainTab(this); showCategoryPairs('forex')">外汇</button>
-        <button class="tab" data-category="metal" onclick="switchMainTab(this); showCategoryPairs('metal')">贵金属</button>
-        <button class="tab" data-category="commodity" onclick="switchMainTab(this); showCategoryPairs('commodity')">大宗商品</button>
-        <button class="tab" data-category="index" onclick="switchMainTab(this); showCategoryPairs('index')">指数</button>
-        <button class="tab" data-category="crypto" onclick="switchMainTab(this); showCategoryPairs('crypto')">虚拟货币</button>
-        <button class="tab" data-category="stock" onclick="switchMainTab(this); showCategoryPairs('stock')">股票</button>
-      </div>
-    </div>
+<div class="sr">
+<div class="clk" id="clk">--:--:--</div>
+<div class="sc"><span class="sn" id="sN">EURUSD</span><span class="sb" onclick="openM()">切换 ▾</span></div>
+<div class="ba"><span class="ba-b" id="bB">--</span><span class="ba-s">/</span><span class="ba-a" id="bA">--</span></div>
+</div>
 
-    <div class="symRow">
-      <div class="symLeftTime" id="sysTime">--:--:--</div>
-      <div class="symCenter">
-        <div class="symName">
-          <span id="symName">XAUUSD</span>
-          <span class="symBadge" onclick="openCurrentCategoryPairs()">切换品种 ▼</span>
-        </div>
-      </div>
-      <div class="symRight">
-        <div class="symBidAsk">
-          <span class="sba-bid" id="sbaBid">--</span>
-          <span class="sba-sep">/</span>
-          <span class="sba-ask" id="sbaAsk">--</span>
-        </div>
-      </div>
-    </div>
+<div class="main">
+<div class="pc">
+<div class="pm"><span class="pv" id="mP">--</span></div>
+<div>
+<div class="pr"><span class="pl">Bid（买入）</span><span class="pvv bid" id="bP">--</span></div>
+<div class="pr"><span class="pl">Mid（中间价）</span><span class="pvv" id="mP2">--</span></div>
+<div class="pr"><span class="pl">Ask（卖出）</span><span class="pvv ask" id="aP">--</span></div>
+<div class="pr"><span class="pl">点差</span><span class="pvv" id="sV" style="color:var(--accent)">--</span></div>
+</div>
+</div>
 
-    <div class="mainContent">
-      <div class="price-card">
-        <div class="price-main">
-          <span class="price-value" id="midPrice">--</span>
-          <span class="price-suffix" id="priceSuffix"></span>
-        </div>
-        <div class="price-detail">
-          <div class="price-item">
-            <span class="price-item-label">买入价 (Bid)</span>
-            <span class="price-item-value bid" id="bidPrice">--</span>
-          </div>
-          <div class="price-item">
-            <span class="price-item-label">中间价</span>
-            <span class="price-item-value" id="midPriceDetail">--</span>
-          </div>
-          <div class="price-item">
-            <span class="price-item-label">卖出价 (Ask)</span>
-            <span class="price-item-value ask" id="askPrice">--</span>
-          </div>
-        </div>
-      </div>
+<div class="cp">
+<div class="ch">
+<div style="display:flex;align-items:center;gap:.75rem"><div class="ct">K 线图</div><div class="ci" id="oI"></div></div>
+<div class="tft">
+<button class="tf on" data-tf="5min" onclick="stf(this)">5m</button>
+<button class="tf" data-tf="10min" onclick="stf(this)">10m</button>
+<button class="tf" data-tf="1hour" onclick="stf(this)">1H</button>
+</div>
+</div>
+<div class="cw" id="cW"><canvas id="kc"></canvas><canvas id="cc"></canvas></div>
+</div>
+</div>
 
-      <div class="chart-panel">
-        <div class="chart-header">
-          <div class="chart-title">分时 K 线</div>
-          <div class="tf-tabs">
-            <button class="tf-tab active" data-tf="5min" onclick="switchTf(this)">5分钟</button>
-            <button class="tf-tab" data-tf="10min" onclick="switchTf(this)">10分钟</button>
-            <button class="tf-tab" data-tf="1hour" onclick="switchTf(this)">1小时</button>
-          </div>
-        </div>
-        <div class="chart-wrap">
-          <canvas id="klineCanvas"></canvas>
-        </div>
-      </div>
-    </div>
+<div class="stb">
+<div class="si"><span class="sg g" id="lS"></span><span id="lT">延迟: --</span></div>
+<div class="si"><span id="sT">点差: --</span></div>
+<div class="si"><span id="uT">数据: --</span></div>
+</div>
+</div>
 
-    <div class="status-bar">
-      <div class="status-item">
-        <span class="signal-dot green" id="latencySignal" title="数据延迟"></span>
-        <span id="latencyText">数据延迟: --</span>
-      </div>
-      <div class="status-item">
-        <span id="spreadText">点差: --</span>
-      </div>
-      <div class="status-item">
-        <span id="updateTimeText">更新时间: --</span>
-      </div>
-    </div>
-  </div>
+<div class="mask" id="msk" onclick="if(event.target.id==='msk')msk.style.display='none'">
+<div class="mdl"><div class="mh"><span id="mTi">切换品种</span><button class="xb" onclick="msk.style.display='none'">✕</button></div>
+<div class="mb" id="mLi"></div></div>
+</div>
 
-  <!-- 品种选择弹窗 -->
-  <div class="modalMask" id="pairMask" onclick="closeModal(event, 'pairMask')">
-    <div class="modal">
-      <div class="modalHeader">
-        <span id="pairModalTitle">切换交易品种</span>
-        <button class="btn" style="border:none; padding:0.25rem 0.5rem;" onclick="$('pairMask').style.display='none'">✕</button>
-      </div>
-      <div class="modalBody" id="pairListContainer"></div>
-    </div>
-  </div>
+<script>
+const $=id=>document.getElementById(id);
+const CP={
+forex:["EURUSD","GBPUSD","USDJPY","USDCHF","AUDUSD","USDCAD","NZDUSD","EURGBP","EURJPY","GBPJPY","AUDJPY","EURAUD","EURCHF","GBPCHF","CHFJPY","CADJPY","AUDNZD","AUDCAD","AUDCHF","EURNZD","EURCAD","CADCHF","NZDJPY","GBPAUD","GBPCAD","GBPNZD","NZDCAD","NZDCHF","USDSGD","USDHKD","USDCNH"],
+metal:["XAUUSD","XAGUSD"],commodity:["UKOUSD","USOUSD"],
+index:["U30USD","NASUSD","SPXUSD","100GBP","D30EUR","E50EUR","H33HKD"],
+crypto:["BTCUSD","ETHUSD","LTCUSD","BCHUSD","XMRUSD","BNBUSD","SOLUSD","ADAUSD","DOGUSD","XSIUSD","AVEUSD","DSHUSD","RPLUSD","LNKUSD"],
+stock:["AAPL","AMZN","BABA","GOOGL","META","MSFT","NFLX","NVDA","TSLA","ABBV","ABNB","ABT","ADBE","AMD","AVGO","C","CRM","DIS","GS","INTC","JNJ","MA","MCD","KO","MMM","NIO","PLTR","SHOP","TSM","V"]
+};
+const CN={forex:"外汇",metal:"贵金属",commodity:"大宗商品",index:"指数",crypto:"虚拟货币",stock:"股票"};
+let S="EURUSD",C="forex",TF="5min",lastM=null,stag=0,sigP=0,cBars=[],L=null;
 
-  <script>
-    const $ = id => document.getElementById(id);
+function dg(s){if(!s)return 2;const u=s.toUpperCase();
+if(u==="XAUUSD"||u==="XAGUSD"||u==="UKOUSD"||u==="USOUSD")return 2;
+if(u==="BTCUSD"||u==="ETHUSD")return 2;
+if(u.endsWith("JPY"))return 3;
+if(["DOGUSD","ADAUSD","RPLUSD","XSIUSD","LNKUSD"].includes(u))return 5;
+if(["LTCUSD","SOLUSD","BCHUSD","XMRUSD","BNBUSD","AVEUSD","DSHUSD"].includes(u))return 2;
+if(["U30USD","NASUSD","SPXUSD","100GBP","D30EUR","E50EUR","H33HKD"].includes(u))return 1;
+// 股票: 没有典型外汇后缀
+const fx=["USD","GBP","EUR","JPY","CHF","AUD","NZD","CAD","HKD","SGD","CNH"];
+if(!fx.some(c=>u.includes(c)))return 2;
+return 5;}
+function fm(n,d){return n!=null?parseFloat(n).toFixed(d):'--'}
 
-    document.addEventListener('touchstart', function(){}, {passive: true});
+function nS(lo,hi,mt){
+if(lo===hi){const d=lo===0?1:Math.abs(lo)*.01;lo-=d;hi+=d}
+const r=hi-lo,p=r*.08;let mn=lo-p,mx=hi+p;
+const rs=(mx-mn)/(mt-1),mg=Math.pow(10,Math.floor(Math.log10(rs))),res=rs/mg;
+let ns;if(res<=1)ns=mg;else if(res<=2)ns=2*mg;else if(res<=2.5)ns=2.5*mg;
+else if(res<=5)ns=5*mg;else ns=10*mg;
+const tI=Math.floor(mn/ns)*ns,tA=Math.ceil(mx/ns)*ns,tk=[];
+for(let v=tI;v<=tA+ns*.5;v+=ns)tk.push(v);
+return{tI,tA,ns,tk}}
 
-    // 产品规格
-    const PRODUCT_SPECS = {
-      // 1. 外汇 (forex)
-      "USDCHF": {"size": 100000, "lev": 500, "currency": "CHF", "type": "forex"},
-      "GBPUSD": {"size": 100000, "lev": 500, "currency": "USD", "type": "forex"},
-      "EURUSD": {"size": 100000, "lev": 500, "currency": "USD", "type": "forex"},
-      "USDJPY": {"size": 100000, "lev": 500, "currency": "JPY", "type": "forex"},
-      "USDCAD": {"size": 100000, "lev": 500, "currency": "CAD", "type": "forex"},
-      "AUDUSD": {"size": 100000, "lev": 500, "currency": "USD", "type": "forex"},
-      "EURGBP": {"size": 100000, "lev": 500, "currency": "GBP", "type": "forex"},
-      "EURAUD": {"size": 100000, "lev": 500, "currency": "AUD", "type": "forex"},
-      "EURCHF": {"size": 100000, "lev": 500, "currency": "CHF", "type": "forex"},
-      "EURJPY": {"size": 100000, "lev": 500, "currency": "JPY", "type": "forex"},
-      "GBPCHF": {"size": 100000, "lev": 500, "currency": "CHF", "type": "forex"},
-      "CADJPY": {"size": 100000, "lev": 500, "currency": "JPY", "type": "forex"},
-      "GBPJPY": {"size": 100000, "lev": 500, "currency": "JPY", "type": "forex"},
-      "AUDNZD": {"size": 100000, "lev": 500, "currency": "NZD", "type": "forex"},
-      "AUDCAD": {"size": 100000, "lev": 500, "currency": "CAD", "type": "forex"},
-      "AUDCHF": {"size": 100000, "lev": 500, "currency": "CHF", "type": "forex"},
-      "AUDJPY": {"size": 100000, "lev": 500, "currency": "JPY", "type": "forex"},
-      "CHFJPY": {"size": 100000, "lev": 500, "currency": "JPY", "type": "forex"},
-      "EURNZD": {"size": 100000, "lev": 500, "currency": "NZD", "type": "forex"},
-      "EURCAD": {"size": 100000, "lev": 500, "currency": "CAD", "type": "forex"},
-      "CADCHF": {"size": 100000, "lev": 500, "currency": "CHF", "type": "forex"},
-      "NZDJPY": {"size": 100000, "lev": 500, "currency": "JPY", "type": "forex"},
-      "NZDUSD": {"size": 100000, "lev": 500, "currency": "USD", "type": "forex"},
-      "GBPAUD": {"size": 100000, "lev": 500, "currency": "AUD", "type": "forex"},
-      "GBPCAD": {"size": 100000, "lev": 500, "currency": "CAD", "type": "forex"},
-      "GBPNZD": {"size": 100000, "lev": 500, "currency": "NZD", "type": "forex"},
-      "NZDCAD": {"size": 100000, "lev": 500, "currency": "CAD", "type": "forex"},
-      "NZDCHF": {"size": 100000, "lev": 500, "currency": "CHF", "type": "forex"},
-      "USDSGD": {"size": 100000, "lev": 500, "currency": "SGD", "type": "forex"},
-      "USDHKD": {"size": 100000, "lev": 500, "currency": "HKD", "type": "forex"},
-      "USDCNH": {"size": 100000, "lev": 500, "currency": "CNH", "type": "forex"},
+function tick(){const n=new Date();$('clk').innerText=[n.getHours(),n.getMinutes(),n.getSeconds()].map(v=>String(v).padStart(2,'0')).join(':')}
+function stab(b,c){document.querySelectorAll('.tab').forEach(t=>t.classList.remove('on'));b.classList.add('on');C=c}
+function openM(){$('mTi').innerText='切换'+(CN[C]||'品种');
+$('mLi').innerHTML=(CP[C]||[]).map(s=>`<div class="it ${s===S?'on':''}" onclick="pick('${s}')"><span>${s}</span></div>`).join('');
+$('msk').style.display='flex'}
+function pick(s){S=s;$('sN').innerText=s;$('msk').style.display='none';
+['bP','aP','mP','mP2','sV','bB','bA'].forEach(id=>{if($(id))$(id).innerText='--'});
+$('sT').innerText='点差: --';lastM=null;stag=0;drawE();rf();fK()}
 
-      // 2. 指数 (index)
-      "U30USD": {"size": 10, "lev": 100, "currency": "USD", "type": "index"},
-      "NASUSD": {"size": 10, "lev": 100, "currency": "USD", "type": "index"},
-      "SPXUSD": {"size": 100, "lev": 100, "currency": "USD", "type": "index"},
-      "100GBP": {"size": 10, "lev": 100, "currency": "GBP", "type": "index"},
-      "D30EUR": {"size": 10, "lev": 100, "currency": "EUR", "type": "index"},
-      "E50EUR": {"size": 10, "lev": 100, "currency": "EUR", "type": "index"},
-      "H33HKD": {"size": 100, "lev": 100, "currency": "HKD", "type": "index"},
+async function rf(){try{
+const r=await fetch('/api/latest_status?symbol='+S),d=await r.json();
+cOk(true);
+if(d.latest_quote){const q=d.latest_quote,D=dg(S);
+if(q.bid!=null&&q.ask!=null){
+const mid=(q.bid+q.ask)/2,prev=lastM;lastM=mid;
+$('bP').innerText=fm(q.bid,D);$('aP').innerText=fm(q.ask,D);
+$('mP').innerText=fm(mid,D);$('mP2').innerText=fm(mid,D);
+$('bB').innerText=fm(q.bid,D);$('bA').innerText=fm(q.ask,D);
+const pe=$('mP');pe.classList.remove('up','down');
+if(prev!=null){if(mid>prev)pe.classList.add('up');else if(mid<prev)pe.classList.add('down')}
+const sp=q.spread!=null?q.spread:((q.ask-q.bid)*Math.pow(10,D>2?0:(5-D))).toFixed(1);
+$('sV').innerText=sp;$('sT').innerText='点差: '+sp}
+const now=Date.now();
+if(q.ts!=null){const sMs=q.ts<1e12?q.ts*1000:q.ts,lat=Math.round(now-sMs-8*3600000);
+$('lT').innerText='延迟: '+lat+'ms';lSig(lat);
+const dt=new Date(sMs+8*3600000);
+$('uT').innerText='数据: '+[dt.getUTCMonth()+1,dt.getUTCDate()].map(v=>String(v).padStart(2,'0')).join('-')+' '+
+[dt.getUTCHours(),dt.getUTCMinutes(),dt.getUTCSeconds()].map(v=>String(v).padStart(2,'0')).join(':')}
+else if(q.received_at)$('uT').innerText='更新: '+(q.received_at.split(' ')[1]||'--')
+}}catch(e){console.error(e);cOk(false)}}
 
-      // 3. 大宗商品 (commodity)
-      "UKOUSD": {"size": 1000, "lev": 500, "currency": "USD", "type": "commodity"},
-      "USOUSD": {"size": 1000, "lev": 500, "currency": "USD", "type": "commodity"},
+async function fK(){try{
+const lm={_5min:300,_10min:250,_1hour:200};
+const r=await fetch('/api/kline?symbol='+S+'&tf='+TF+'&limit='+(lm['_'+TF]||300)),d=await r.json();
+if(d.bars&&d.bars.length>0){cBars=d.bars;drawK(d.bars)}else{cBars=[];drawE()}
+}catch(e){drawE()}}
+function stf(b){document.querySelectorAll('.tf').forEach(t=>t.classList.remove('on'));b.classList.add('on');TF=b.dataset.tf;fK()}
 
-      // 4. 贵金属 (metal)
-      "XAGUSD": {"size": 5000, "lev": 500, "currency": "USD", "type": "metal"},
-      "XAUUSD": {"size": 100, "lev": 500, "currency": "USD", "type": "metal"},
+// ========== K线绘制 ==========
+function drawK(bars){
+const cv=$('kc');if(!cv)return;const ctx=cv.getContext('2d');
+const dpr=devicePixelRatio||1,w=cv.offsetWidth,h=cv.offsetHeight;
+if(w<=0||h<=0)return;cv.width=w*dpr;cv.height=h*dpr;ctx.scale(dpr,dpr);ctx.clearRect(0,0,w,h);
+if(!bars||!bars.length){drawE();return}
+const PL=8,PR=72,PT=16,PB=24,cW=w-PL-PR,cH=h-PT-PB;
+if(cW<=0||cH<=0)return;
+const df={_5min:80,_10min:60,_1hour:48};
+let vn=Math.min(df['_'+TF]||80,bars.length,Math.floor(cW/6));
+vn=Math.max(vn,Math.min(20,bars.length));
+const vb=bars.slice(-vn),n=vb.length;if(!n)return;
+let dMin=Infinity,dMax=-Infinity;
+for(const b of vb){if(b[2]>dMax)dMax=b[2];if(b[3]<dMin)dMin=b[3]}
+const D=dg(S),sc=nS(dMin,dMax,6),yI=sc.tI,yA=sc.tA,yR=yA-yI||1;
+const p2y=p=>PT+cH*(1-(p-yI)/yR),y2p=y=>yI+(1-(y-PT)/cH)*yR;
+const bT=cW/n,gap=Math.max(1,Math.round(bT*.2)),bW=Math.max(1,Math.floor(bT-gap)),hB=bW/2;
+const bx=i=>PL+(i+.5)*bT;
+L={PL,PR,PT,PB,cW,cH,n,bT,yI,yA,yR,p2y,y2p,bx,D,vb};
+const G='#0ecb81',R='#f6465d',gr='rgba(255,255,255,0.04)',ax='#5e6673';
+// Y轴
+ctx.font='11px "SF Mono",Menlo,monospace';ctx.textAlign='left';ctx.textBaseline='middle';
+for(const t of sc.tk){const y=p2y(t);if(y<PT-2||y>PT+cH+2)continue;
+ctx.strokeStyle=gr;ctx.lineWidth=1;ctx.beginPath();ctx.moveTo(PL,Math.round(y)+.5);ctx.lineTo(PL+cW,Math.round(y)+.5);ctx.stroke();
+ctx.fillStyle=ax;ctx.fillText(t.toFixed(D),PL+cW+8,y)}
+// 烛台
+for(let i=0;i<n;i++){const b=vb[i],o=b[1],hi=b[2],lo=b[3],cl=b[4];
+const up=cl>=o,col=up?G:R,x=bx(i);
+ctx.strokeStyle=col;ctx.lineWidth=1;ctx.beginPath();
+ctx.moveTo(Math.round(x)+.5,Math.round(p2y(hi)));ctx.lineTo(Math.round(x)+.5,Math.round(p2y(lo)));ctx.stroke();
+const yO=p2y(o),yC=p2y(cl),bt=Math.min(yO,yC),bb=Math.max(yO,yC);
+ctx.fillStyle=col;ctx.fillRect(Math.round(x-hB),Math.round(bt),bW,Math.max(1,bb-bt))}
+// 最新价虚线
+if(n>0){const lc=vb[n-1][4],up=lc>=vb[n-1][1],col=up?G:R,yL=p2y(lc);
+ctx.setLineDash([4,3]);ctx.strokeStyle=col;ctx.lineWidth=1;
+ctx.beginPath();ctx.moveTo(PL,Math.round(yL)+.5);ctx.lineTo(PL+cW,Math.round(yL)+.5);ctx.stroke();ctx.setLineDash([]);
+const tW=PR-6,tH=18,tX=PL+cW+2,tY=Math.round(yL)-tH/2;
+ctx.fillStyle=col;ctx.beginPath();ctx.roundRect(tX,tY,tW,tH,3);ctx.fill();
+ctx.fillStyle='#fff';ctx.font='bold 11px "SF Mono",Menlo,monospace';ctx.textAlign='center';ctx.textBaseline='middle';
+ctx.fillText(lc.toFixed(D),tX+tW/2,Math.round(yL))}
+// X轴
+ctx.fillStyle=ax;ctx.font='10px "SF Mono",Menlo,monospace';ctx.textAlign='center';ctx.textBaseline='top';
+const mG=60,iMs=TF==='1hour'?3600000*4:TF==='10min'?3600000:1800000;let lX=-Infinity;
+for(let i=0;i<n;i++){const ts=vb[i][0],x=bx(i);
+if(ts%iMs!==0&&i!==0&&i!==n-1)continue;if(x-lX<mG)continue;
+const d=new Date(ts+8*3600000);let lb;
+if(TF==='1hour')lb=(d.getUTCMonth()+1)+'/'+d.getUTCDate()+' '+String(d.getUTCHours()).padStart(2,'0')+':00';
+else lb=String(d.getUTCHours()).padStart(2,'0')+':'+String(d.getUTCMinutes()).padStart(2,'0');
+ctx.strokeStyle=gr;ctx.lineWidth=1;ctx.beginPath();ctx.moveTo(Math.round(x)+.5,PT+cH);ctx.lineTo(Math.round(x)+.5,PT+cH+4);ctx.stroke();
+ctx.fillStyle=ax;ctx.fillText(lb,x,PT+cH+6);lX=x}
+clrCH()}
 
-      // 5. 虚拟货币 (crypto)
-      "BTCUSD": {"size": 1, "lev": 500, "currency": "USD", "type": "crypto"},
-      "BCHUSD": {"size": 100, "lev": 500, "currency": "USD", "type": "crypto"},
-      "RPLUSD": {"size": 10000, "lev": 500, "currency": "USD", "type": "crypto"},
-      "LTCUSD": {"size": 100, "lev": 500, "currency": "USD", "type": "crypto"},
-      "ETHUSD": {"size": 10, "lev": 500, "currency": "USD", "type": "crypto"},
-      "XMRUSD": {"size": 100, "lev": 500, "currency": "USD", "type": "crypto"},
-      "BNBUSD": {"size": 100, "lev": 500, "currency": "USD", "type": "crypto"},
-      "SOLUSD": {"size": 100, "lev": 500, "currency": "USD", "type": "crypto"},
-      "LNKUSD": {"size": 1000, "lev": 500, "currency": "USD", "type": "crypto"},
-      "XSIUSD": {"size": 1000, "lev": 500, "currency": "USD", "type": "crypto"},
-      "DOGUSD": {"size": 100000, "lev": 500, "currency": "USD", "type": "crypto"},
-      "ADAUSD": {"size": 10000, "lev": 500, "currency": "USD", "type": "crypto"},
-      "AVEUSD": {"size": 100, "lev": 500, "currency": "USD", "type": "crypto"},
-      "DSHUSD": {"size": 1000, "lev": 500, "currency": "USD", "type": "crypto"},
+function drawE(){const cv=$('kc');if(!cv)return;const ctx=cv.getContext('2d'),dpr=devicePixelRatio||1,w=cv.offsetWidth,h=cv.offsetHeight;
+cv.width=w*dpr;cv.height=h*dpr;ctx.scale(dpr,dpr);ctx.clearRect(0,0,w,h);
+ctx.fillStyle='#5e6673';ctx.font='13px sans-serif';ctx.textAlign='center';ctx.textBaseline='middle';
+ctx.fillText('暂无 K 线数据',w/2,h/2);clrCH();L=null}
 
-      // 6. 股票 (stock)
-      "AAPL":  {"size": 100, "lev": 10, "currency": "USD", "type": "stock"},
-      "AMZN":  {"size": 100, "lev": 10, "currency": "USD", "type": "stock"},
-      "BABA":  {"size": 100, "lev": 10, "currency": "USD", "type": "stock"},
-      "GOOGL": {"size": 100, "lev": 10, "currency": "USD", "type": "stock"},
-      "META":  {"size": 100, "lev": 10, "currency": "USD", "type": "stock"},
-      "MSFT":  {"size": 100, "lev": 10, "currency": "USD", "type": "stock"},
-      "NFLX":  {"size": 100, "lev": 10, "currency": "USD", "type": "stock"},
-      "NVDA":  {"size": 100, "lev": 10, "currency": "USD", "type": "stock"},
-      "TSLA":  {"size": 100, "lev": 10, "currency": "USD", "type": "stock"},
-      "ABBV":  {"size": 100, "lev": 10, "currency": "USD", "type": "stock"},
-      "ABNB":  {"size": 100, "lev": 10, "currency": "USD", "type": "stock"},
-      "ABT":   {"size": 100, "lev": 10, "currency": "USD", "type": "stock"},
-      "ADBE":  {"size": 100, "lev": 10, "currency": "USD", "type": "stock"},
-      "AMD":   {"size": 100, "lev": 10, "currency": "USD", "type": "stock"},
-      "AVGO":  {"size": 100, "lev": 10, "currency": "USD", "type": "stock"},
-      "C":     {"size": 100, "lev": 10, "currency": "USD", "type": "stock"},
-      "CRM":   {"size": 100, "lev": 10, "currency": "USD", "type": "stock"},
-      "DIS":   {"size": 100, "lev": 10, "currency": "USD", "type": "stock"},
-      "GS":    {"size": 100, "lev": 10, "currency": "USD", "type": "stock"},
-      "INTC":  {"size": 100, "lev": 10, "currency": "USD", "type": "stock"},
-      "JNJ":   {"size": 100, "lev": 10, "currency": "USD", "type": "stock"},
-      "MA":    {"size": 100, "lev": 10, "currency": "USD", "type": "stock"},
-      "MCD":   {"size": 100, "lev": 10, "currency": "USD", "type": "stock"},
-      "KO":    {"size": 100, "lev": 10, "currency": "USD", "type": "stock"},
-      "MMM":   {"size": 100, "lev": 10, "currency": "USD", "type": "stock"},
-      "NIO":   {"size": 100, "lev": 10, "currency": "USD", "type": "stock"},
-      "PLTR":  {"size": 100, "lev": 10, "currency": "USD", "type": "stock"},
-      "SHOP":  {"size": 100, "lev": 10, "currency": "USD", "type": "stock"},
-      "TSM":   {"size": 100, "lev": 10, "currency": "USD", "type": "stock"},
-      "V":     {"size": 100, "lev": 10, "currency": "USD", "type": "stock"},
-    };
+// ===== 十字光标 =====
+function clrCH(){const cv=$('cc');if(!cv)return;const dpr=devicePixelRatio||1,w=cv.offsetWidth,h=cv.offsetHeight;
+cv.width=w*dpr;cv.height=h*dpr;cv.getContext('2d').scale(dpr,dpr);$('oI').innerText=''}
+function dCH(mx,my){const cv=$('cc');if(!cv||!L)return;
+const dpr=devicePixelRatio||1,w=cv.offsetWidth,h=cv.offsetHeight;
+cv.width=w*dpr;cv.height=h*dpr;const ctx=cv.getContext('2d');ctx.scale(dpr,dpr);
+const{PL,PT,cW,cH,n,bT,D,vb,p2y,y2p,bx}=L;
+const cx=Math.max(PL,Math.min(mx,PL+cW)),cy=Math.max(PT,Math.min(my,PT+cH));
+const idx=Math.max(0,Math.min(Math.round((cx-PL)/bT-.5),n-1)),sx=bx(idx);
+ctx.setLineDash([3,3]);ctx.strokeStyle='rgba(255,255,255,0.25)';ctx.lineWidth=1;
+ctx.beginPath();ctx.moveTo(Math.round(sx)+.5,PT);ctx.lineTo(Math.round(sx)+.5,PT+cH);ctx.stroke();
+ctx.beginPath();ctx.moveTo(PL,Math.round(cy)+.5);ctx.lineTo(PL+cW,Math.round(cy)+.5);ctx.stroke();
+ctx.setLineDash([]);
+const pr=y2p(cy);ctx.fillStyle='#2b3139';
+const tW2=64,tH2=18,tX2=PL+cW+2,tY2=Math.round(cy)-tH2/2;
+ctx.beginPath();ctx.roundRect(tX2,tY2,tW2,tH2,3);ctx.fill();
+ctx.fillStyle='#eaecef';ctx.font='11px "SF Mono",Menlo,monospace';ctx.textAlign='center';ctx.textBaseline='middle';
+ctx.fillText(pr.toFixed(D),tX2+tW2/2,Math.round(cy));
+if(idx>=0&&idx<n){const b=vb[idx],ts=b[0],d=new Date(ts+8*3600000);
+let lb;if(TF==='1hour')lb=(d.getUTCMonth()+1)+'/'+d.getUTCDate()+' '+String(d.getUTCHours()).padStart(2,'0')+':00';
+else lb=String(d.getUTCHours()).padStart(2,'0')+':'+String(d.getUTCMinutes()).padStart(2,'0');
+const tw=ctx.measureText(lb).width+12,tx=Math.round(sx)-tw/2,ty=PT+cH+2;
+ctx.fillStyle='#2b3139';ctx.beginPath();ctx.roundRect(tx,ty,tw,16,3);ctx.fill();
+ctx.fillStyle='#eaecef';ctx.font='10px "SF Mono",Menlo,monospace';ctx.textAlign='center';ctx.textBaseline='top';
+ctx.fillText(lb,Math.round(sx),ty+2);
+const o=b[1],hi=b[2],lo=b[3],cl=b[4],up=cl>=o,c2=up?'#0ecb81':'#f6465d';
+$('oI').innerHTML=`<span style="color:${c2}">O:${o.toFixed(D)} H:${hi.toFixed(D)} L:${lo.toFixed(D)} C:${cl.toFixed(D)}</span>`}}
 
-    // 分类产品映射
-    const CATEGORY_PAIRS = {
-      "forex":     ["EURUSD", "GBPUSD", "USDJPY", "USDCHF", "AUDUSD", "USDCAD", "NZDUSD", "EURGBP", "EURJPY", "GBPJPY", "AUDJPY", "EURAUD", "EURCHF", "GBPCHF", "CHFJPY", "CADJPY", "AUDNZD", "AUDCAD", "AUDCHF", "EURNZD", "EURCAD", "CADCHF", "NZDJPY", "GBPAUD", "GBPCAD", "GBPNZD", "NZDCAD", "NZDCHF", "USDSGD", "USDHKD", "USDCNH"],
-      "index":      ["U30USD", "NASUSD", "SPXUSD", "100GBP", "D30EUR", "E50EUR", "H33HKD"],
-      "commodity":  ["UKOUSD", "USOUSD"],
-      "metal":      ["XAUUSD", "XAGUSD"],
-      "crypto":     ["BTCUSD", "ETHUSD", "LTCUSD", "BCHUSD", "XMRUSD", "BNBUSD", "SOLUSD", "ADAUSD", "DOGUSD", "XSIUSD", "AVEUSD", "DSHUSD", "RPLUSD", "LNKUSD"],
-      "stock":      ["AAPL", "AMZN", "BABA", "GOOGL", "META", "MSFT", "NFLX", "NVDA", "TSLA", "ABBV", "ABNB", "ABT", "ADBE", "AMD", "AVGO", "C", "CRM", "DIS", "GS", "INTC", "JNJ", "MA", "MCD", "KO", "MMM", "NIO", "PLTR", "SHOP", "TSM", "V"],
-    };
+(function(){const wr=$('cW');if(!wr)return;
+function pos(e){const r=wr.getBoundingClientRect();return e.touches?{x:e.touches[0].clientX-r.left,y:e.touches[0].clientY-r.top}:{x:e.clientX-r.left,y:e.clientY-r.top}}
+wr.addEventListener('mousemove',e=>{const p=pos(e);dCH(p.x,p.y)});
+wr.addEventListener('mouseleave',()=>clrCH());
+wr.addEventListener('touchmove',e=>{e.preventDefault();const p=pos(e);dCH(p.x,p.y)},{passive:false});
+wr.addEventListener('touchend',()=>clrCH())})();
 
-    window.currentSymbol = "EURUSD";
-    window.currentCategory = "forex";
-    window.lastDataTime = 0;
-    window.stagnationCount = 0;
+function lSig(v){const s=$('lS');if(!s)return;s.className='sg';
+if(v<500)s.classList.add('g');else if(v<2000)s.classList.add('y');else s.classList.add('r')}
+function cOk(ok){const d=$('cD'),t=$('cT');if(!d||!t)return;d.className='dot';
+if(ok){d.classList.add('ok');t.innerText='已连接'}else{d.classList.add('err');t.innerText='连接断开'}}
+function chkS(){const p=parseFloat($('mP')?.innerText)||0;
+if(sigP===p&&p>0){stag++;if(stag>=5){const s=$('lS');if(s){s.className='sg';s.classList.add('r')}$('lT').innerText='数据停滞!'}}
+else stag=0;sigP=p}
 
-    // 格式化数字
-    function fmtNum(n, d) { return parseFloat(n).toFixed(d); }
-
-    // 价格精度
-    function getPriceDigits(symbol) {
-      if (!symbol) return 2;
-      // 贵金属 / 原油：2位
-      if (symbol === "XAUUSD" || symbol === "XAGUSD" || symbol === "UKOUSD" || symbol === "USOUSD") return 2;
-      // 加密货币：2位
-      if (symbol.startsWith("BTC") || symbol === "ETHUSD" || symbol === "LTCUSD" || symbol === "SOLUSD") return 2;
-      // 股票（美股）：2位
-      if (PRODUCT_SPECS[symbol]?.type === "stock") return 2;
-      // 指数（印度/香港等可能是整数或2位）
-      if (PRODUCT_SPECS[symbol]?.type === "index") return 2;
-      // 外汇默认5位
-      return 5;
-    }
-
-    // 更新时间显示
-    function updateClock() {
-      const now = new Date();
-      const h = String(now.getHours()).padStart(2, '0');
-      const m = String(now.getMinutes()).padStart(2, '0');
-      const s = String(now.getSeconds()).padStart(2, '0');
-      if ($('sysTime')) $('sysTime').innerText = `${h}:${m}:${s}`;
-    }
-
-    // 切换主分类 Tab
-    function switchMainTab(btn) {
-      document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
-      btn.classList.add('active');
-    }
-
-    // 显示分类品种列表
-    function showCategoryPairs(category) {
-      window.currentCategory = category;
-    }
-
-    // 打开品种选择弹窗
-    function openCurrentCategoryPairs() {
-      const container = $('pairListContainer');
-      const title = $('pairModalTitle');
-      const categoryNames = {
-        "forex": "外汇",
-        "index": "指数",
-        "commodity": "大宗商品",
-        "metal": "贵金属",
-        "crypto": "虚拟货币",
-        "stock": "股票",
-      };
-
-      title.innerText = `切换${categoryNames[window.currentCategory] || '品种'}`;
-
-      const pairs = CATEGORY_PAIRS[window.currentCategory] || [];
-      container.innerHTML = pairs.map(symbol => `
-        <div class="select-item ${symbol === window.currentSymbol ? 'active' : ''}" onclick="selectSymbol('${symbol}')">
-          <span>${symbol}</span>
-          <span style="color: var(--muted); font-size: 0.875rem;">${PRODUCT_SPECS[symbol]?.type || ''}</span>
-        </div>
-      `).join('');
-
-      $('pairMask').style.display = 'flex';
-    }
-
-    // 选择品种
-    function selectSymbol(symbol) {
-      window.currentSymbol = symbol;
-      if ($('symName')) $('symName').innerText = symbol;
-      $('pairMask').style.display = 'none';
-      // 重置价格显示
-      if ($('bidPrice')) $('bidPrice').innerText = '--';
-      if ($('askPrice')) $('askPrice').innerText = '--';
-      if ($('midPrice')) $('midPrice').innerText = '--';
-      if ($('midPriceDetail')) $('midPriceDetail').innerText = '--';
-      if ($('spreadText')) $('spreadText').innerText = '点差: --';
-      if ($('sbaBid')) $('sbaBid').innerText = '--';
-      if ($('sbaAsk')) $('sbaAsk').innerText = '--';
-      window.lastDataTime = 0;
-      window.stagnationCount = 0;
-      drawEmptyChart();
-      refreshData();
-    }
-
-    // 关闭弹窗
-    function closeModal(event, id) {
-      if (event.target.id === id) {
-        $(id).style.display = 'none';
-      }
-    }
-
-    // 刷新数据
-    async function refreshData() {
-      try {
-        const response = await fetch(`/api/latest_status?symbol=${window.currentSymbol}`);
-        const data = await response.json();
-
-        // 更新连接状态
-        updateConnectionStatus(true);
-
-        // 更新价格
-        if (data.latest_quote) {
-          const quote = data.latest_quote;
-          const digits = getPriceDigits(window.currentSymbol);
-
-          if ($('bidPrice')) $('bidPrice').innerText = fmtNum(quote.bid, digits);
-          if ($('askPrice')) $('askPrice').innerText = fmtNum(quote.ask, digits);
-          if ($('midPrice')) $('midPrice').innerText = fmtNum((quote.bid + quote.ask) / 2, digits);
-          if ($('midPriceDetail')) $('midPriceDetail').innerText = fmtNum((quote.bid + quote.ask) / 2, digits);
-          if ($('sbaBid')) $('sbaBid').innerText = fmtNum(quote.bid, digits);
-          if ($('sbaAsk')) $('sbaAsk').innerText = fmtNum(quote.ask, digits);
-
-          // 更新点差
-          const spread = quote.spread != null ? quote.spread : ((quote.ask - quote.bid) * Math.pow(10, digits > 2 ? 0 : (5 - digits))).toFixed(1);
-          if ($('spreadText')) $('spreadText').innerText = `点差: ${spread}`;
-
-          // 数据时间与延迟（服务器 UTC -> 展示为 UTC+8 北京时间）
-          const now = Date.now();
-          if (quote.ts != null) {
-            // 服务器发来 UTC 秒（<1e12）或 UTC 毫秒（>=1e12）
-            const serverMs = quote.ts < 1e12 ? quote.ts * 1000 : quote.ts;
-            // Date.now() 是浏览器本地时间(UTC+8)，serverMs 是 UTC
-            // latency = (本地时间 ms) - (UTC 时间 ms) - 8小时补偿
-            // = (UTC ms + 8h) - UTC ms = 正确延迟
-            const latency = Math.round(now - serverMs - 8 * 3600 * 1000);
-            window.lastDataTime = serverMs;
-            if ($('latencyText')) $('latencyText').innerText = `延迟: ${latency}ms`;
-            updateLatencySignal(latency);
-            if ($('updateTimeText')) {
-              // UTC 时间 +8 小时 -> 北京时间显示
-              const d = new Date(serverMs + 8 * 3600 * 1000);
-              const mm = String(d.getUTCMonth() + 1).padStart(2, '0');
-              const dd = String(d.getUTCDate()).padStart(2, '0');
-              const hh = String(d.getUTCHours()).padStart(2, '0');
-              const mi = String(d.getUTCMinutes()).padStart(2, '0');
-              const ss = String(d.getUTCSeconds()).padStart(2, '0');
-              $('updateTimeText').innerText = `数据: ${mm}-${dd} ${hh}:${mi}:${ss}`;
-            }
-          } else if (quote.received_at && $('updateTimeText')) {
-            $('updateTimeText').innerText = `更新: ${quote.received_at.split(' ')[1] || '--'}`;
-          }
-        }
-
-      } catch (error) {
-        console.error('获取数据失败:', error);
-        updateConnectionStatus(false);
-      }
-    }
-
-    // 切换K线周期
-    function switchTf(btn) {
-      document.querySelectorAll('.tf-tab').forEach(t => t.classList.remove('active'));
-      btn.classList.add('active');
-      window.currentTf = btn.dataset.tf;
-      fetchKline();
-    }
-
-    // 获取并渲染K线
-    async function fetchKline() {
-      try {
-        const tf = window.currentTf || '5min';
-        const limitMap = { "5min": 300, "10min": 250, "1hour": 200 };
-        const resp = await fetch(`/api/kline?symbol=${window.currentSymbol}&tf=${tf}&limit=${limitMap[tf]}`);
-        const data = await resp.json();
-        if (data.bars && data.bars.length > 0) {
-          drawKline(data.bars);
-        } else {
-          drawEmptyChart();
-        }
-      } catch (e) {
-        console.error('K线获取失败', e);
-        drawEmptyChart();
-      }
-    }
-
-    // 柱线图渲染（OHLC烛台）
-    function drawKline(bars) {
-      const canvas = $('klineCanvas');
-      if (!canvas) return;
-      const ctx = canvas.getContext('2d');
-
-      const dpr = window.devicePixelRatio || 1;
-      const w = canvas.offsetWidth;
-      const h = canvas.offsetHeight;
-      if (w <= 0 || h <= 0) return;
-      canvas.width = w * dpr;
-      canvas.height = h * dpr;
-      ctx.scale(dpr, dpr);
-
-      ctx.clearRect(0, 0, w, h);
-
-      if (!bars || bars.length === 0) { drawEmptyChart(); return; }
-
-      // 边距：左侧留空、右侧给价格轴、底部给时间轴
-      const PAD_LEFT = 12;
-      const PAD_RIGHT = 60;
-      const PAD_TOP = 12;
-      const PAD_BOTTOM = 28;
-      const chartW = w - PAD_LEFT - PAD_RIGHT;
-      const chartH = h - PAD_TOP - PAD_BOTTOM;
-      if (chartW <= 0 || chartH <= 0) return;
-
-      // 根据周期调整可见K线数量
-      const tf = window.currentTf || '5min';
-      const visibleCountMap = { "5min": 60, "10min": 50, "1hour": 40 };
-      const visibleCount = visibleCountMap[tf] || 60;
-      const visibleBars = bars.slice(-visibleCount);
-      const n = visibleBars.length;
-      if (n === 0) return;
-
-      // 价格范围（OHLC）
-      let minP = Infinity, maxP = -Infinity;
-      for (const b of visibleBars) {
-        if (b[1] < minP) minP = b[1];
-        if (b[2] > maxP) maxP = b[2];
-        if (b[3] < minP) minP = b[3];
-        if (b[4] > maxP) maxP = b[4];
-      }
-      const priceRange = maxP - minP || 0.0001;
-      const extra = priceRange * 0.08;
-      minP -= extra;
-      maxP += extra;
-      const priceToY = p => PAD_TOP + chartH - ((p - minP) / (maxP - minP)) * chartH;
-
-      const barGap = 3;
-      const barTotalW = chartW / n;
-      const barW = Math.max(2, Math.floor(barTotalW) - barGap);
-
-      const green = '#0ecb81';
-      const red = '#f6465d';
-
-      // 网格线（仅在图表区内）
-      ctx.strokeStyle = 'rgba(0,0,0,0.06)';
-      ctx.lineWidth = 1;
-      ctx.setLineDash([3, 3]);
-      for (let i = 0; i <= 4; i++) {
-        const y = PAD_TOP + (chartH / 4) * i;
-        ctx.beginPath();
-        ctx.moveTo(PAD_LEFT, y);
-        ctx.lineTo(PAD_LEFT + chartW, y);
-        ctx.stroke();
-      }
-      ctx.setLineDash([]);
-
-      // 烛台
-      for (let i = 0; i < n; i++) {
-        const b = visibleBars[i];
-        const open = b[1], high = b[2], low = b[3], close = b[4];
-        const isGreen = close >= open;
-        const color = isGreen ? green : red;
-        const x = PAD_LEFT + (i + 0.5) * barTotalW;
-
-        ctx.strokeStyle = color;
-        ctx.lineWidth = 1;
-        ctx.beginPath();
-        ctx.moveTo(x, priceToY(high));
-        ctx.lineTo(x, priceToY(low));
-        ctx.stroke();
-
-        const yTop = priceToY(Math.max(open, close));
-        const yBot = priceToY(Math.min(open, close));
-        const bodyH = Math.max(1, yBot - yTop);
-        ctx.fillStyle = color;
-        ctx.fillRect(x - barW / 2, yTop, barW, bodyH);
-      }
-
-      // 价格轴（右侧）
-      const digits = getPriceDigits(window.currentSymbol);
-      ctx.fillStyle = '#848e9c';
-      ctx.font = '11px monospace';
-      ctx.textAlign = 'right';
-      for (let i = 0; i <= 4; i++) {
-        const p = minP + ((maxP - minP) / 4) * (4 - i);
-        const y = PAD_TOP + (chartH / 4) * i;
-        ctx.fillText(p.toFixed(digits), w - 8, y + 4);
-      }
-
-      // 时间轴（底部）：服务器 UTC -> 显示 UTC+8
-      ctx.fillStyle = '#848e9c';
-      ctx.font = '10px sans-serif';
-      ctx.textAlign = 'center';
-      const step = Math.max(1, Math.floor(n / 5));
-      for (let i = 0; i < n; i += step) {
-        const b = visibleBars[i];
-        const tsMs = typeof b[0] === 'number' ? b[0] : b[0] * 1000;
-        // UTC -> UTC+8：加 8 小时
-        const d = new Date(tsMs + 8 * 60 * 60 * 1000);
-        let label;
-        if (tf === '1hour') {
-          label = `${d.getMonth() + 1}/${d.getDate()} ${d.getHours().toString().padStart(2,'0')}`;
-        } else {
-          label = `${d.getHours().toString().padStart(2,'0')}:${d.getMinutes().toString().padStart(2,'0')}`;
-        }
-        const x = PAD_LEFT + (i + 0.5) * barTotalW;
-        ctx.fillText(label, x, h - 8);
-      }
-    }
-
-    function drawEmptyChart() {
-      const canvas = $('klineCanvas');
-      if (!canvas) return;
-      const ctx = canvas.getContext('2d');
-      const w = canvas.offsetWidth;
-      const h = canvas.offsetHeight;
-      const dpr = window.devicePixelRatio || 1;
-      canvas.width = w * dpr;
-      canvas.height = h * dpr;
-      ctx.scale(dpr, dpr);
-      ctx.clearRect(0, 0, w, h);
-      ctx.fillStyle = '#848e9c';
-      ctx.font = '13px -apple-system, sans-serif';
-      ctx.textAlign = 'center';
-      ctx.fillText('暂无 K 线数据', w / 2, h / 2);
-    }
-
-    function resizeCanvas() {
-      if (window._klineTimer) clearTimeout(window._klineTimer);
-      window._klineTimer = setTimeout(fetchKline, 100);
-    }
-
-    // 更新延迟信号灯
-    function updateLatencySignal(latency) {
-      const signal = $('latencySignal');
-      if (!signal) return;
-
-      signal.className = 'signal-dot';
-      if (latency < 500) {
-        signal.classList.add('green');
-      } else if (latency < 2000) {
-        signal.classList.add('yellow');
-      } else {
-        signal.classList.add('red');
-      }
-    }
-
-    // 更新连接状态
-    function updateConnectionStatus(connected) {
-      const dot = $('connDot');
-      const text = $('connText');
-      if (!dot || !text) return;
-
-      dot.className = 'conn-dot';
-      if (connected) {
-        dot.classList.add('active');
-        text.innerText = '已连接';
-      } else {
-        dot.classList.add('error');
-        text.innerText = '连接断开';
-      }
-    }
-
-    // 价格停滞检测
-    function checkPriceStagnation() {
-      const currentPrice = parseFloat($('midPrice')?.innerText) || 0;
-      if (window.lastPriceForSignal === currentPrice && currentPrice > 0) {
-        window.stagnationCount++;
-        if (window.stagnationCount >= 5) {
-          const signal = $('latencySignal');
-          if (signal) {
-            signal.className = 'signal-dot';
-            signal.classList.add('red');
-          }
-          if ($('latencyText')) $('latencyText').innerText = '数据停滞!';
-        }
-      } else {
-        window.stagnationCount = 0;
-      }
-      window.lastPriceForSignal = currentPrice;
-    }
-
-    // 初始化
-    function init() {
-      updateClock();
-      setInterval(updateClock, 1000);
-      refreshData();
-      setInterval(refreshData, 2000);
-      setInterval(checkPriceStagnation, 2000);
-      window.currentTf = '5min';
-      fetchKline();
-      setInterval(fetchKline, 3000);
-      window.addEventListener('resize', resizeCanvas);
-    }
-
-    init();
-  </script>
-</body>
-</html>
+tick();setInterval(tick,1000);rf();setInterval(rf,2000);setInterval(chkS,2000);
+fK();setInterval(fK,3000);
+addEventListener('resize',()=>{clearTimeout(window._rt);window._rt=setTimeout(()=>{if(cBars.length)drawK(cBars);else drawE()},100)});
+</script>
+</body></html>
 """
 
 @app.route("/")
 def index():
     return render_template_string(HTML_TEMPLATE)
 
-# ==================== 启动 ====================
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=True)
