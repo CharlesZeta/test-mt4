@@ -86,6 +86,79 @@ history_poll = deque(maxlen=MAX_HISTORY)
 history_echo = deque(maxlen=MAX_HISTORY)
 history_lock = threading.RLock()
 
+# 与 K 线同源：最后一笔报价按归一化品种缓存，避免仅依赖 history 扫描或 JSON 形态差异导致页面不同步
+latest_quote_cache = {}
+quote_cache_lock = threading.Lock()
+
+def _to_float(v):
+    if v is None:
+        return None
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+def _bid_ask_from_dict(d):
+    if not isinstance(d, dict):
+        return None, None
+    for bk, ak in (("bid", "ask"), ("Bid", "Ask"), ("BID", "ASK")):
+        b, a = _to_float(d.get(bk)), _to_float(d.get(ak))
+        if b is not None and a is not None:
+            return b, a
+    return None, None
+
+def _message_to_quote_dict(p):
+    """message 可能是 JSON 字符串或已是 dict"""
+    m = p.get("message")
+    if m is None:
+        return None
+    if isinstance(m, dict):
+        return m
+    if isinstance(m, str) and m.strip():
+        try:
+            o = json.loads(m)
+            return o if isinstance(o, dict) else None
+        except Exception:
+            return None
+    return None
+
+def cache_tick_quote(raw_symbol, bid, ask, spread=None, ts=None):
+    norm = normalize_symbol(raw_symbol or "")
+    if not norm:
+        return
+    b, a = _to_float(bid), _to_float(ask)
+    if b is None or a is None:
+        return
+    rec = {
+        "bid": b,
+        "ask": a,
+        "symbol": norm,
+        "spread": spread,
+        "ts": ts,
+        "received_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    with quote_cache_lock:
+        latest_quote_cache[norm] = rec
+
+def ingest_quote_from_parsed(p):
+    """从 MT4 report 解析对象尽量提取 bid/ask 并写入缓存"""
+    if not isinstance(p, dict):
+        return
+    rs = p.get("symbol") or p.get("Symbol") or ""
+    b, a = _bid_ask_from_dict(p)
+    qd = None
+    if b is None or a is None:
+        qd = _message_to_quote_dict(p)
+        if qd:
+            b, a = _bid_ask_from_dict(qd)
+    if b is None or a is None:
+        return
+    sp = p.get("spread")
+    if sp is None and qd is not None:
+        sp = qd.get("spread")
+    ts = p.get("ts") or p.get("time") or p.get("Time")
+    cache_tick_quote(rs, b, a, spread=sp, ts=ts)
+
 # ==================== 产品规则表（完整版） ====================
 PRODUCT_SPECS = {
     "USDCHF":{"size":100000,"lev":500,"currency":"CHF","type":"forex"},
@@ -231,6 +304,8 @@ def store_mt4_data(raw_body, client_ip, headers_dict):
     if isinstance(parsed_json, dict):
         for k in ["account","server","balance","equity","floating_pnl","leverage_used","risk_flags","exposure_notional","positions"]:
             record[k] = parsed_json.get(k)
+        if category == "report" or request.path.rstrip("/").endswith("/mt4/quote"):
+            ingest_quote_from_parsed(parsed_json)
     with history_lock:
         {"status":history_status,"positions":history_positions,"report":history_report,
          "poll":history_poll,"echo":history_echo}.get(category, history_echo).appendleft(record)
@@ -252,27 +327,39 @@ def api_debug_symbols():
 # ==================== 最新状态接口 ====================
 @app.route("/api/latest_status", methods=["GET"])
 def api_latest_status():
-    sf = request.args.get("symbol", "").upper()
+    sf = request.args.get("symbol", "").strip().upper()
     detail = latest_quote = None
+    if sf:
+        nk = normalize_symbol(sf)
+        with quote_cache_lock:
+            cq = latest_quote_cache.get(nk)
+        if cq:
+            latest_quote = dict(cq)
     with history_lock:
         sr = history_status[0] if history_status else None
         pr = history_positions[0] if history_positions else None
 
-        for record in history_report:
-            p = record.get("parsed")
-            if not isinstance(p, dict): continue
-            if p.get("desc") == "QUOTE_DATA":
-                rs = p.get("symbol", "")
-                if sf and not _symbol_matches(rs, sf): continue
-                try:
-                    qd = json.loads(p.get("message", "{}"))
-                    if isinstance(qd, dict) and "bid" in qd:
-                        latest_quote = {"bid":qd["bid"],"ask":qd["ask"],
-                            "symbol":normalize_symbol(rs) or rs,
-                            "spread":p.get("spread"),"ts":p.get("ts"),
-                            "received_at":record.get("received_at")}
-                        break
-                except: pass
+        if not latest_quote:
+            for record in history_report:
+                p = record.get("parsed")
+                if not isinstance(p, dict): continue
+                if p.get("desc") == "QUOTE_DATA":
+                    rs = p.get("symbol", "")
+                    if sf and not _symbol_matches(rs, sf): continue
+                    qd = _message_to_quote_dict(p)
+                    if not qd:
+                        try:
+                            qd = json.loads(p.get("message") or "{}")
+                        except Exception:
+                            qd = None
+                    if isinstance(qd, dict):
+                        b, a = _bid_ask_from_dict(qd)
+                        if b is not None and a is not None:
+                            latest_quote = {"bid": b, "ask": a,
+                                "symbol": normalize_symbol(rs) or rs,
+                                "spread": p.get("spread"), "ts": p.get("ts"),
+                                "received_at": record.get("received_at")}
+                            break
 
         if not latest_quote:
             for record in history_report:
@@ -280,11 +367,12 @@ def api_latest_status():
                 if not isinstance(p, dict): continue
                 rs = p.get("symbol", "")
                 if sf and not _symbol_matches(rs, sf): continue
-                if p.get("bid") is not None and p.get("ask") is not None:
-                    latest_quote = {"bid":p["bid"],"ask":p["ask"],
-                        "symbol":normalize_symbol(rs) or rs,
-                        "spread":p.get("spread"),"ts":p.get("ts"),
-                        "received_at":record.get("received_at")}
+                b, a = _bid_ask_from_dict(p)
+                if b is not None and a is not None:
+                    latest_quote = {"bid": b, "ask": a,
+                        "symbol": normalize_symbol(rs) or rs,
+                        "spread": p.get("spread"), "ts": p.get("ts"),
+                        "received_at": record.get("received_at")}
                     break
 
         if not latest_quote and sr:
@@ -349,15 +437,24 @@ def receive_tick():
             sym_raw = tick.get('symbol')
             bid, ask = tick.get('bid'), tick.get('ask')
             tt = tick.get('tick_time')
-            if not sym_raw or not bid or not ask: continue
-            ts_ms = (tt * 1000) if tt else int(time.time() * 1000)
-            update_kline(sym_raw, float(bid), float(ask), ts_ms)
+            if not sym_raw or bid is None or ask is None:
+                continue
+            bf, af = _to_float(bid), _to_float(ask)
+            if bf is None or af is None:
+                continue
+            if tt is not None:
+                tft = float(tt)
+                ts_ms = int(tft) if tft > 1e12 else int(tft * 1000)
+            else:
+                ts_ms = int(time.time() * 1000)
+            update_kline(sym_raw, bf, af, ts_ms)
+            cache_tick_quote(sym_raw, bf, af, spread=tick.get('spread'), ts=tt)
             record = {
                 "received_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 "ip": get_client_ip(), "method": "POST", "path": "/api/tick",
                 "category": "report", "headers": {}, "body_raw": json.dumps(tick),
                 "parsed": {"desc":"QUOTE_DATA","spread":tick.get('spread',0),"ts":tt,
-                    "message":json.dumps({"bid":bid,"ask":ask}),
+                    "message":json.dumps({"bid":bf,"ask":af}),
                     "symbol":sym_raw,"account":"tick_stream"}
             }
             with history_lock:
@@ -574,30 +671,30 @@ function pick(s){S=s;$('sN').innerText=s;$('msk').style.display='none';
 $('sT').innerText='点差: --';lastM=null;stag=0;drawE();rf();fK()}
 
 async function rf(){try{
-const r=await fetch('/api/latest_status?symbol='+S),d=await r.json();
+const r=await fetch('/api/latest_status?symbol='+encodeURIComponent(S)),d=await r.json();
 cOk(true);
 if(d.latest_quote){const q=d.latest_quote,D=dg(S);
-if(q.bid!=null&&q.ask!=null){
-const mid=(q.bid+q.ask)/2,prev=lastM;lastM=mid;
-$('bP').innerText=fm(q.bid,D);$('aP').innerText=fm(q.ask,D);
+const b=Number(q.bid),a=Number(q.ask);
+if(Number.isFinite(b)&&Number.isFinite(a)){
+const mid=(b+a)/2,prev=lastM;lastM=mid;
+$('bP').innerText=fm(b,D);$('aP').innerText=fm(a,D);
 $('mP').innerText=fm(mid,D);$('mP2').innerText=fm(mid,D);
-$('bB').innerText=fm(q.bid,D);$('bA').innerText=fm(q.ask,D);
+$('bB').innerText=fm(b,D);$('bA').innerText=fm(a,D);
 const pe=$('mP');pe.classList.remove('up','down');
 if(prev!=null){if(mid>prev)pe.classList.add('up');else if(mid<prev)pe.classList.add('down')}
-const sp=q.spread!=null?q.spread:((q.ask-q.bid)*Math.pow(10,D>2?0:(5-D))).toFixed(1);
+const sp=q.spread!=null?q.spread:((a-b)*Math.pow(10,D>2?0:(5-D))).toFixed(1);
 $('sV').innerText=sp;$('sT').innerText='点差: '+sp}
-const now=Date.now();
-if(q.ts!=null){const sMs=q.ts<1e12?q.ts*1000:q.ts,lat=Math.round(now-sMs-8*3600000);
-$('lT').innerText='延迟: '+lat+'ms';lSig(lat);
-const dt=new Date(sMs+8*3600000);
-$('uT').innerText='数据: '+[dt.getUTCMonth()+1,dt.getUTCDate()].map(v=>String(v).padStart(2,'0')).join('-')+' '+
-[dt.getUTCHours(),dt.getUTCMinutes(),dt.getUTCSeconds()].map(v=>String(v).padStart(2,'0')).join(':')}
+if(q.ts!=null){const t=Number(q.ts),sMs=t<1e12?t*1000:t,now=Date.now(),lat=Math.round(now-sMs);
+if(Number.isFinite(sMs)&&Number.isFinite(lat)&&Math.abs(lat)<=600000){$('lT').innerText='延迟: '+lat+'ms';lSig(lat)}
+else{$('lT').innerText='延迟: --';lSig(99999)}
+const dt=new Date(sMs);
+$('uT').innerText='数据: '+dt.toLocaleString('zh-CN',{hour12:false,timeZone:'Asia/Shanghai',year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit'}).replace(/\//g,'-')}
 else if(q.received_at)$('uT').innerText='更新: '+(q.received_at.split(' ')[1]||'--')
 }}catch(e){console.error(e);cOk(false)}}
 
 async function fK(){try{
 const lm={_5min:300,_10min:250,_1hour:200};
-const r=await fetch('/api/kline?symbol='+S+'&tf='+TF+'&limit='+(lm['_'+TF]||300)),d=await r.json();
+const r=await fetch('/api/kline?symbol='+encodeURIComponent(S)+'&tf='+encodeURIComponent(TF)+'&limit='+(lm['_'+TF]||300)),d=await r.json();
 if(d.bars&&d.bars.length>0){cBars=d.bars;drawK(d.bars)}else{cBars=[];drawE()}
 }catch(e){drawE()}}
 function stf(b){document.querySelectorAll('.tf').forEach(t=>t.classList.remove('on'));b.classList.add('on');TF=b.dataset.tf;fK()}
@@ -703,7 +800,7 @@ if(sigP===p&&p>0){stag++;if(stag>=5){const s=$('lS');if(s){s.className='sg';s.cl
 else stag=0;sigP=p}
 
 tick();setInterval(tick,1000);rf();setInterval(rf,2000);setInterval(chkS,2000);
-fK();setInterval(fK,3000);
+fK();setInterval(fK,2000);
 addEventListener('resize',()=>{clearTimeout(window._rt);window._rt=setTimeout(()=>{if(cBars.length)drawK(cBars);else drawE()},100)});
 </script>
 </body></html>
