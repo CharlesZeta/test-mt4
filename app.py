@@ -822,8 +822,12 @@ def _parse_ts(val):
         v = int(val)
         return v if v > 1e12 else v * 1000
     for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
-        try: return int(datetime.strptime(val, fmt).timestamp() * 1000)
-        except ValueError: continue
+        try:
+            # 使用东八区解析字符串时间
+            dt = datetime.strptime(val, fmt).replace(tzinfo=SH_TZ)
+            return int(dt.timestamp() * 1000)
+        except ValueError:
+            continue
     return None
 
 @app.route('/api/hist', methods=['GET'])
@@ -835,8 +839,12 @@ def api_hist():
     norm = normalize_symbol(symbol)
     limit = min(int(request.args.get("limit", 1000)), 10000)
     agg = request.args.get("agg", "raw")
-    from_ts = _parse_ts(request.args.get("from")) or (int(time.time()*1000) - 3600000)
-    to_ts = _parse_ts(request.args.get("to")) or (int(time.time()*1000) + 60000)
+    # 使用东八区当前时间计算默认时间范围
+    now_sh = now_shanghai_dt()
+    default_from = int(now_sh.timestamp() * 1000) - 3600000  # 1小时前
+    default_to = int(now_sh.timestamp() * 1000) + 60000       # 1分钟后
+    from_ts = _parse_ts(request.args.get("from")) or default_from
+    to_ts = _parse_ts(request.args.get("to")) or default_to
     try:
         conn = get_conn()
         with conn.cursor() as cur:
@@ -1021,8 +1029,12 @@ def api_quote_hist():
         return jsonify({"error": "symbol required"}), 400
     norm = normalize_symbol(symbol)
     limit = min(int(request.args.get("limit", 100)), 5000)
-    from_ts = _parse_ts(request.args.get("from")) or (int(time.time()*1000) - 3600000)
-    to_ts = _parse_ts(request.args.get("to")) or (int(time.time()*1000) + 60000)
+    # 使用东八区当前时间计算默认时间范围
+    now_sh = now_shanghai_dt()
+    default_from = int(now_sh.timestamp() * 1000) - 3600000  # 1小时前
+    default_to = int(now_sh.timestamp() * 1000) + 60000       # 1分钟后
+    from_ts = _parse_ts(request.args.get("from")) or default_from
+    to_ts = _parse_ts(request.args.get("to")) or default_to
     try:
         conn = get_conn()
         with conn.cursor() as cur:
@@ -1180,6 +1192,13 @@ HTML_TEMPLATE = r"""<!doctype html>
 :root{--bg:#0b0e11;--card:#161a1e;--card2:#1e2329;--text:#eaecef;--muted:#5e6673;
 --line:#2b3139;--green:#0ecb81;--red:#f6465d;--yellow:#f0b90b;--accent:#f0b90b;
 --safe-b:env(safe-area-inset-bottom)}
+/* 浅色主题：白天 6:00-20:00 */
+:root.light{--bg:#ffffff;--card:#f5f5f5;--card2:#ebebeb;--text:#1a1a1a;--muted:#666666;
+--line:#d0d0d0;--green:#0ea571;--red:#e53935;--yellow:#e6a700;--accent:#d4880a}
+/* 浅色主题下的 K 线图适配 */
+:root.light .cp{background:var(--bg);border-color:var(--line)}
+:root.light .cw{background:#ffffff}
+:root.light canvas{background:#ffffff}
 *{box-sizing:border-box;-webkit-tap-highlight-color:transparent;outline:none}
 html{font-size:16px}body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC",sans-serif;
 color:var(--text);background:var(--bg);line-height:1.5;overflow-x:hidden}
@@ -1316,6 +1335,23 @@ align-items:center;border-radius:.5rem;cursor:pointer;transition:.1s;color:var(-
 </div>
 
 <script>
+// ==================== 主题切换（东八区 20:00-06:00 深色，其余浅色） ====================
+function applyThemeByShanghaiTime(){
+  const now=new Date();
+  const hour=now.toLocaleString('zh-CN',{timeZone:'Asia/Shanghai',hour:'2-digit',hour12:false});
+  const h=parseInt(hour,10);
+  // 20:00-23:59 和 00:00-06:00 为深色模式
+  if(h>=20||h<6){
+    document.documentElement.classList.remove('light');
+  }else{
+    document.documentElement.classList.add('light');
+  }
+}
+// 页面加载时应用主题
+applyThemeByShanghaiTime();
+// 每分钟检查一次主题
+setInterval(applyThemeByShanghaiTime,60000);
+
 // ==================== 全局状态 ====================
 const $=id=>document.getElementById(id);
 const CP={
