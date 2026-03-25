@@ -4,160 +4,37 @@ import threading
 import traceback
 import time
 import re
-from datetime import datetime, timedelta
+from datetime import datetime
 from collections import deque
 from flask import Flask, request, render_template_string, jsonify
 
-# ==================== MySQL ====================
-import pymysql
-from pymysql.cursors import DictCursor
-from dbutils.pooled_db import PooledDB
-
 app = Flask(__name__)
-
-# ==================== MySQL 连接池 ====================
-MYSQL_HOST = os.environ.get("MYSQL_HOST", "127.0.0.1")
-MYSQL_PORT = int(os.environ.get("MYSQL_PORT", 3306))
-MYSQL_USER = os.environ.get("MYSQL_USER", "root")
-MYSQL_PASS = os.environ.get("MYSQL_PASSWORD", "")
-MYSQL_DB   = os.environ.get("MYSQL_DATABASE", "mt4data")
-
-_pool = None
-_db_ok = False  # Track whether DB is available
-
-def get_pool():
-    global _pool
-    if _pool is None:
-        _pool = PooledDB(
-            creator=pymysql,
-            maxconnections=10,
-            mincached=0,       # ★ Don't connect on pool creation
-            maxcached=5,
-            blocking=False,    # ★ Don't block if pool exhausted
-            host=MYSQL_HOST,
-            port=MYSQL_PORT,
-            user=MYSQL_USER,
-            passwd=MYSQL_PASS,
-            db=MYSQL_DB,
-            charset="utf8mb4",
-            cursorclass=DictCursor,
-            autocommit=True,
-            connect_timeout=3, # ★ 3s timeout, don't block worker
-        )
-    return _pool
-
-def get_conn():
-    return get_pool().connection()
-
-def init_db():
-    global _db_ok
-    try:
-        conn = get_conn()
-        with conn.cursor() as cur:
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS tick_logs (
-                    id          BIGINT AUTO_INCREMENT PRIMARY KEY,
-                    symbol      VARCHAR(20)  NOT NULL,
-                    bid         DOUBLE       NOT NULL,
-                    ask         DOUBLE       NOT NULL,
-                    spread      DOUBLE       DEFAULT 0,
-                    mid         DOUBLE       DEFAULT 0,
-                    tick_time   BIGINT       NOT NULL COMMENT 'ms timestamp',
-                    received_at DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
-                    INDEX idx_sym_time (symbol, tick_time),
-                    INDEX idx_time (tick_time)
-                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-            """)
-        conn.close()
-        _db_ok = True
-        print("[DB] tick_logs ready")
-    except Exception as e:
-        _db_ok = False
-        print(f"[DB] init failed (will retry): {e}")
-
-# ★ Run init_db at module load (works with gunicorn)
-threading.Thread(target=init_db, daemon=True).start()
-
-# ==================== 写入缓冲区 ====================
-FLUSH_SIZE = 50
-FLUSH_INTERVAL = 2.0
-_write_buf = []
-_buf_lock = threading.Lock()
-_last_flush = time.time()
-
-def _buf_append(row):
-    global _last_flush
-    with _buf_lock:
-        _write_buf.append(row)
-        if len(_write_buf) >= FLUSH_SIZE:
-            _flush_buf()
-
-def _flush_buf():
-    global _write_buf, _last_flush
-    if not _write_buf:
-        return
-    batch = _write_buf[:]
-    _write_buf = []
-    _last_flush = time.time()
-    threading.Thread(target=_do_insert, args=(batch,), daemon=True).start()
-
-def _do_insert(batch):
-    global _db_ok
-    if not _db_ok:
-        # Try to init DB on first successful insert
-        try:
-            init_db()
-        except Exception:
-            return
-    try:
-        conn = get_conn()
-        with conn.cursor() as cur:
-            cur.executemany(
-                "INSERT INTO tick_logs (symbol,bid,ask,spread,mid,tick_time,received_at) "
-                "VALUES (%s,%s,%s,%s,%s,%s,%s)",
-                batch
-            )
-        conn.close()
-        _db_ok = True
-    except Exception as e:
-        _db_ok = False
-        print(f"[DB] batch insert failed ({len(batch)}): {e}")
-
-def _flush_timer():
-    while True:
-        time.sleep(FLUSH_INTERVAL)
-        with _buf_lock:
-            if _write_buf and (time.time() - _last_flush) >= FLUSH_INTERVAL:
-                _flush_buf()
-
-threading.Thread(target=_flush_timer, daemon=True).start()
 
 # ==================== 全局数据结构 ====================
 MAX_HISTORY = 50
 KLINE_MAX = {"5min": 300, "10min": 250, "1hour": 200}
 kline_data = {}
 kline_locks = {}
-latest_quotes = {}
-quotes_lock = threading.Lock()
 
-# ★ Diagnostic counters
-_tick_recv_count = 0
-_tick_recv_lock = threading.Lock()
-_last_tick_at = None
-
-# ==================== 品种名归一化 ====================
+# ==================== 品种名归一化（核心修复） ====================
 KNOWN_SYMBOLS = set()
 
-def normalize_symbol(raw_symbol):
+def normalize_symbol(raw_symbol: str) -> str:
+    """
+    将 MT4 原始品种名归一化为标准名。
+    MT4 经纪商经常给品种加后缀: EURUSDm, XAUUSD.a, NASUSDc, U30USD.r 等
+    """
     if not raw_symbol:
         return ""
     s = raw_symbol.strip().upper()
     if s in KNOWN_SYMBOLS:
         return s
+    # 去掉末尾 1~4 字符尝试匹配
     for trim in range(1, 5):
         candidate = s[:-trim] if len(s) > trim else ""
         if candidate and candidate in KNOWN_SYMBOLS:
             return candidate
+    # 去掉点号后缀
     if '.' in s:
         candidate = s.split('.')[0]
         if candidate in KNOWN_SYMBOLS:
@@ -174,17 +51,14 @@ def get_kline_lock(symbol):
     return kline_locks[symbol]
 
 def _floor_ts(ts_ms, tf):
-    if tf == "5min":
-        step = 5 * 60 * 1000
-    elif tf == "10min":
-        step = 10 * 60 * 1000
-    elif tf == "1hour":
-        step = 60 * 60 * 1000
-    else:
-        step = 60 * 1000
+    if tf == "5min":     step = 5 * 60 * 1000
+    elif tf == "10min":  step = 10 * 60 * 1000
+    elif tf == "1hour":  step = 60 * 60 * 1000
+    else:                step = 60 * 1000
     return (ts_ms // step) * step
 
 def update_kline(symbol, bid, ask, tick_ts_ms):
+    """bar 格式: [ts, open, high, low, close]  索引: 0, 1, 2, 3, 4"""
     mid = (bid + ask) / 2.0
     norm = normalize_symbol(symbol)
     tfs = ["5min", "10min", "1hour"]
@@ -196,9 +70,10 @@ def update_kline(symbol, bid, ask, tick_ts_ms):
             bars = kline_data[norm][tf]
             if bars and bars[-1][0] == bar_ts:
                 bar = bars[-1]
-                bar[2] = max(bar[2], mid)
-                bar[3] = min(bar[3], mid)
-                bar[4] = mid
+                # ★ 修复: open(bar[1])不动, 只更新 high/low/close
+                bar[2] = max(bar[2], mid)   # high
+                bar[3] = min(bar[3], mid)   # low
+                bar[4] = mid                # close
             else:
                 bars.append([bar_ts, mid, mid, mid, mid])
                 if len(bars) > KLINE_MAX[tf]:
@@ -211,7 +86,80 @@ history_poll = deque(maxlen=MAX_HISTORY)
 history_echo = deque(maxlen=MAX_HISTORY)
 history_lock = threading.RLock()
 
-# ==================== 产品规则表 ====================
+# 与 K 线同源：最后一笔报价按归一化品种缓存，避免仅依赖 history 扫描或 JSON 形态差异导致页面不同步
+latest_quote_cache = {}
+quote_cache_lock = threading.Lock()
+
+def _to_float(v):
+    if v is None:
+        return None
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+def _bid_ask_from_dict(d):
+    if not isinstance(d, dict):
+        return None, None
+    for bk, ak in (("bid", "ask"), ("Bid", "Ask"), ("BID", "ASK")):
+        b, a = _to_float(d.get(bk)), _to_float(d.get(ak))
+        if b is not None and a is not None:
+            return b, a
+    return None, None
+
+def _message_to_quote_dict(p):
+    """message 可能是 JSON 字符串或已是 dict"""
+    m = p.get("message")
+    if m is None:
+        return None
+    if isinstance(m, dict):
+        return m
+    if isinstance(m, str) and m.strip():
+        try:
+            o = json.loads(m)
+            return o if isinstance(o, dict) else None
+        except Exception:
+            return None
+    return None
+
+def cache_tick_quote(raw_symbol, bid, ask, spread=None, ts=None):
+    norm = normalize_symbol(raw_symbol or "")
+    if not norm:
+        return
+    b, a = _to_float(bid), _to_float(ask)
+    if b is None or a is None:
+        return
+    rec = {
+        "bid": b,
+        "ask": a,
+        "symbol": norm,
+        "spread": spread,
+        "ts": ts,
+        "received_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    with quote_cache_lock:
+        latest_quote_cache[norm] = rec
+
+def ingest_quote_from_parsed(p):
+    """从 MT4 report 解析对象尽量提取 bid/ask 并写入缓存"""
+    if not isinstance(p, dict):
+        return
+    rs = p.get("symbol") or p.get("Symbol") or ""
+    b, a = _bid_ask_from_dict(p)
+    qd = None
+    if b is None or a is None:
+        qd = _message_to_quote_dict(p)
+        if qd:
+            b, a = _bid_ask_from_dict(qd)
+    if b is None or a is None:
+        return
+    sp = p.get("spread")
+    if sp is None and qd is not None:
+        sp = qd.get("spread")
+    ts = p.get("ts") or p.get("time") or p.get("Time")
+    cache_tick_quote(rs, b, a, spread=sp, ts=ts)
+
+# ==================== 产品规则表（完整版） ====================
 PRODUCT_SPECS = {
     "USDCHF":{"size":100000,"lev":500,"currency":"CHF","type":"forex"},
     "GBPUSD":{"size":100000,"lev":500,"currency":"USD","type":"forex"},
@@ -300,6 +248,7 @@ PRODUCT_SPECS = {
     "TSM":{"size":100,"lev":10,"currency":"USD","type":"stock"},
     "V":{"size":100,"lev":10,"currency":"USD","type":"stock"},
 }
+
 KNOWN_SYMBOLS = set(PRODUCT_SPECS.keys())
 
 # ==================== 工具函数 ====================
@@ -309,7 +258,7 @@ def norm_str(x):
 def get_client_ip():
     return request.headers.get('X-Real-Ip') or request.headers.get('X-Forwarded-For', request.remote_addr)
 
-def try_parse_json(raw_body):
+def try_parse_json(raw_body: str):
     cleaned = (raw_body or "").strip()
     if not cleaned:
         return None, None, None, None
@@ -324,367 +273,68 @@ def try_parse_json(raw_body):
         parse_error = str(e)
         parse_error_detail = traceback.format_exc()
     except Exception as e:
-        parse_error = str(e)
+        parse_error = f"未知异常: {str(e)}"
         parse_error_detail = traceback.format_exc()
     return parsed_json, parse_error, parse_error_detail, remaining_data
 
 def detect_category(path, parsed_json):
-    if path.endswith("/web/api/mt4/status"):
-        return "status"
-    if path.endswith("/web/api/mt4/positions"):
-        return "positions"
-    if path.endswith("/web/api/mt4/report"):
-        return "report"
-    if path.endswith("/web/api/echo"):
-        return "echo"
-    if path.endswith("/web/api/mt4/commands"):
-        return "poll"
+    if path.endswith("/web/api/mt4/status"):    return "status"
+    if path.endswith("/web/api/mt4/positions"):  return "positions"
+    if path.endswith("/web/api/mt4/report"):     return "report"
+    if path.endswith("/web/api/echo"):           return "echo"
+    if path.endswith("/web/api/mt4/commands"):   return "poll"
     return "other"
 
 def _symbol_matches(record_symbol_raw, filter_symbol):
-    if not filter_symbol:
-        return True
-    if not record_symbol_raw:
-        return False
+    """模糊匹配: EURUSDm -> EURUSD"""
+    if not filter_symbol: return True
+    if not record_symbol_raw: return False
     return normalize_symbol(record_symbol_raw) == filter_symbol
-
-def _update_quote_cache(symbol_raw, bid, ask, spread=None, ts=None):
-    norm = normalize_symbol(symbol_raw)
-    if not norm:
-        return
-    try:
-        b = float(bid) if bid is not None else None
-        a = float(ask) if ask is not None else None
-    except (ValueError, TypeError):
-        return
-    if b is None or a is None:
-        return
-    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    with quotes_lock:
-        latest_quotes[norm] = {"bid": b, "ask": a, "spread": spread, "ts": ts, "received_at": now_str}
 
 def store_mt4_data(raw_body, client_ip, headers_dict):
     parsed_json, parse_error, parse_error_detail, remaining_data = try_parse_json(raw_body)
     category = detect_category(request.path, parsed_json if isinstance(parsed_json, dict) else None)
     record = {
         "received_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "ip": client_ip,
-        "method": request.method,
-        "path": request.path,
-        "category": category,
-        "headers": headers_dict,
-        "body_raw": raw_body,
-        "parsed": parsed_json,
-        "parse_error": parse_error,
-        "parse_error_detail": parse_error_detail,
-        "remaining_data": remaining_data,
+        "ip": client_ip, "method": request.method, "path": request.path,
+        "category": category, "headers": headers_dict, "body_raw": raw_body,
+        "parsed": parsed_json, "parse_error": parse_error,
+        "parse_error_detail": parse_error_detail, "remaining_data": remaining_data,
     }
     if isinstance(parsed_json, dict):
-        for k in ["account", "server", "balance", "equity", "floating_pnl", "leverage_used", "risk_flags", "exposure_notional", "positions"]:
+        for k in ["account","server","balance","equity","floating_pnl","leverage_used","risk_flags","exposure_notional","positions"]:
             record[k] = parsed_json.get(k)
-        sym = parsed_json.get("symbol", "")
-        if sym:
-            if parsed_json.get("desc") == "QUOTE_DATA":
-                try:
-                    qd = json.loads(parsed_json.get("message", "{}"))
-                    if isinstance(qd, dict) and "bid" in qd:
-                        _update_quote_cache(sym, qd["bid"], qd["ask"], spread=parsed_json.get("spread"), ts=parsed_json.get("ts"))
-                except Exception:
-                    pass
-            elif parsed_json.get("bid") is not None and parsed_json.get("ask") is not None:
-                _update_quote_cache(sym, parsed_json["bid"], parsed_json["ask"], spread=parsed_json.get("spread"), ts=parsed_json.get("ts"))
+        if category == "report" or request.path.rstrip("/").endswith("/mt4/quote"):
+            ingest_quote_from_parsed(parsed_json)
     with history_lock:
-        target = {"status": history_status, "positions": history_positions, "report": history_report, "poll": history_poll, "echo": history_echo}.get(category, history_echo)
-        target.appendleft(record)
+        {"status":history_status,"positions":history_positions,"report":history_report,
+         "poll":history_poll,"echo":history_echo}.get(category, history_echo).appendleft(record)
     return parsed_json, record
 
-
-# ================================================================
-#  tick-ren + tick-hist
-# ================================================================
-def _process_tick(tick):
-    sym_raw = tick.get('symbol')
-    bid = tick.get('bid')
-    ask = tick.get('ask')
-    tt = tick.get('tick_time')
-    if not sym_raw or bid is None or ask is None:
-        return None
-    bid_f = float(bid)
-    ask_f = float(ask)
-    spread = float(tick.get('spread', 0))
-    ts_ms = int(tt * 1000) if tt else int(time.time() * 1000)
-    mid = (bid_f + ask_f) / 2.0
-    norm = normalize_symbol(sym_raw)
-    now_dt = datetime.now()
-    now_str = now_dt.strftime("%Y-%m-%d %H:%M:%S.") + f"{now_dt.microsecond // 1000:03d}"
-
-    # 1) memory
-    update_kline(sym_raw, bid_f, ask_f, ts_ms)
-    _update_quote_cache(sym_raw, bid_f, ask_f, spread=spread, ts=tt)
-
-    # 2) history_report for frontend compat
-    record = {
-        "received_at": now_dt.strftime("%Y-%m-%d %H:%M:%S"),
-        "ip": get_client_ip(),
-        "method": "POST",
-        "path": request.path,
-        "category": "report",
-        "headers": {},
-        "body_raw": json.dumps(tick),
-        "parsed": {
-            "desc": "QUOTE_DATA",
-            "spread": spread,
-            "ts": tt,
-            "message": json.dumps({"bid": bid_f, "ask": ask_f}),
-            "symbol": sym_raw,
-            "account": "tick_stream",
-        },
-    }
-    with history_lock:
-        history_report.appendleft(record)
-
-    # 3) MySQL buffer
-    _buf_append((norm, bid_f, ask_f, spread, mid, ts_ms, now_str))
-
-    # 4) counter
-    global _tick_recv_count, _last_tick_at
-    with _tick_recv_lock:
-        _tick_recv_count += 1
-        _last_tick_at = now_dt.strftime("%Y-%m-%d %H:%M:%S")
-
-    return norm
-
-
-@app.route('/api/tick-ren', methods=['POST'])
-def tick_ren():
-    try:
-        ticks = request.json
-        if not isinstance(ticks, list):
-            ticks = [ticks]
-        count = 0
-        for t in ticks:
-            if _process_tick(t):
-                count += 1
-        return jsonify({"ok": True, "processed": count}), 200
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
-
-
-@app.route('/api/tick-hist', methods=['POST'])
-def tick_hist():
-    try:
-        ticks = request.json
-        if not isinstance(ticks, list):
-            ticks = [ticks]
-        rows = []
-        now_dt = datetime.now()
-        now_str = now_dt.strftime("%Y-%m-%d %H:%M:%S.") + f"{now_dt.microsecond // 1000:03d}"
-        for tick in ticks:
-            sym_raw = tick.get('symbol')
-            bid = tick.get('bid')
-            ask = tick.get('ask')
-            tt = tick.get('tick_time')
-            if not sym_raw or bid is None or ask is None:
-                continue
-            bid_f = float(bid)
-            ask_f = float(ask)
-            spread = float(tick.get('spread', 0))
-            ts_ms = int(tt * 1000) if tt else int(time.time() * 1000)
-            mid = (bid_f + ask_f) / 2.0
-            norm = normalize_symbol(sym_raw)
-            rows.append((norm, bid_f, ask_f, spread, mid, ts_ms, now_str))
-        if rows:
-            try:
-                conn = get_conn()
-                with conn.cursor() as cur:
-                    cur.executemany(
-                        "INSERT INTO tick_logs (symbol,bid,ask,spread,mid,tick_time,received_at) VALUES (%s,%s,%s,%s,%s,%s,%s)",
-                        rows,
-                    )
-                conn.close()
-            except Exception as e:
-                return jsonify({"ok": False, "error": f"DB: {e}", "attempted": len(rows)}), 500
-        return jsonify({"ok": True, "inserted": len(rows)}), 200
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
-
-
-# ==================== 历史查询 ====================
-def _parse_ts(val):
-    if not val:
-        return None
-    val = val.strip()
-    if val.isdigit():
-        v = int(val)
-        return v if v > 1e12 else v * 1000
-    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
-        try:
-            dt = datetime.strptime(val, fmt)
-            return int(dt.timestamp() * 1000)
-        except ValueError:
-            continue
-    return None
-
-
-@app.route('/api/hist', methods=['GET'])
-def api_hist():
-    symbol = request.args.get("symbol", "").upper()
-    if not symbol:
-        return jsonify({"error": "symbol required"}), 400
-    norm = normalize_symbol(symbol)
-    limit = min(int(request.args.get("limit", 1000)), 10000)
-    agg = request.args.get("agg", "raw")
-    from_ts = _parse_ts(request.args.get("from"))
-    to_ts = _parse_ts(request.args.get("to"))
-    if from_ts is None:
-        from_ts = int(time.time() * 1000) - 3600 * 1000
-    if to_ts is None:
-        to_ts = int(time.time() * 1000) + 60000
-    try:
-        conn = get_conn()
-        with conn.cursor() as cur:
-            if agg == "raw":
-                cur.execute(
-                    "SELECT symbol,bid,ask,spread,mid,tick_time,received_at FROM tick_logs "
-                    "WHERE symbol=%s AND tick_time>=%s AND tick_time<=%s ORDER BY tick_time ASC LIMIT %s",
-                    (norm, from_ts, to_ts, limit),
-                )
-                rows = cur.fetchall()
-                for r in rows:
-                    if isinstance(r.get("received_at"), datetime):
-                        r["received_at"] = r["received_at"].strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-            elif agg in ("1s", "5s", "1min"):
-                step = {"1s": 1000, "5s": 5000, "1min": 60000}[agg]
-                cur.execute(
-                    "SELECT FLOOR(tick_time/%s)*%s AS ts, "
-                    "SUBSTRING_INDEX(GROUP_CONCAT(mid ORDER BY tick_time ASC),',',1)+0 AS open, "
-                    "MAX(mid) AS high, MIN(mid) AS low, "
-                    "SUBSTRING_INDEX(GROUP_CONCAT(mid ORDER BY tick_time DESC),',',1)+0 AS close, "
-                    "COUNT(*) AS ticks, AVG(spread) AS avg_spread "
-                    "FROM tick_logs WHERE symbol=%s AND tick_time>=%s AND tick_time<=%s "
-                    "GROUP BY FLOOR(tick_time/%s) ORDER BY ts ASC LIMIT %s",
-                    (step, step, norm, from_ts, to_ts, step, limit),
-                )
-                rows = cur.fetchall()
-                for r in rows:
-                    r["ts"] = int(r["ts"])
-                    r["open"] = float(r["open"])
-                    r["close"] = float(r["close"])
-            else:
-                return jsonify({"error": "unsupported agg: " + agg}), 400
-        conn.close()
-        return jsonify({"symbol": norm, "from": from_ts, "to": to_ts, "agg": agg, "count": len(rows), "data": rows})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
-@app.route('/api/hist/stats', methods=['GET'])
-def api_hist_stats():
-    try:
-        conn = get_conn()
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT symbol, COUNT(*) AS cnt, MIN(tick_time) AS first_ts, MAX(tick_time) AS last_ts "
-                "FROM tick_logs GROUP BY symbol ORDER BY cnt DESC"
-            )
-            rows = cur.fetchall()
-            for r in rows:
-                r["first_ts"] = int(r["first_ts"])
-                r["last_ts"] = int(r["last_ts"])
-        conn.close()
-        return jsonify({"symbols": rows, "total_symbols": len(rows)})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
-# ==================== 兼容旧 /api/tick ====================
-@app.route('/api/tick', methods=['POST'])
-def receive_tick():
-    try:
-        ticks = request.json
-        if not isinstance(ticks, list):
-            ticks = [ticks]
-        for t in ticks:
-            _process_tick(t)
-        return '', 204
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-
-# ==================== 调试 ====================
+# ==================== 调试接口 ====================
 @app.route("/api/debug/symbols", methods=["GET"])
 def api_debug_symbols():
+    """查看 MT4 推送的原始品种名 vs 归一化后的名字，调试匹配问题"""
     raw_syms = {}
     with history_lock:
         for r in history_report:
             p = r.get("parsed")
             if isinstance(p, dict) and p.get("symbol"):
-                raw_syms[p["symbol"]] = normalize_symbol(p["symbol"])
-    with quotes_lock:
-        cached = {k: {"bid": v["bid"], "ask": v["ask"], "ts": v["ts"]} for k, v in latest_quotes.items()}
-    return jsonify({"raw_to_normalized": raw_syms, "known_count": len(KNOWN_SYMBOLS), "cached_quotes": cached})
+                raw = p["symbol"]
+                raw_syms[raw] = normalize_symbol(raw)
+    return jsonify({"raw_to_normalized": raw_syms, "known_count": len(KNOWN_SYMBOLS)})
 
-
-@app.route("/api/debug/db", methods=["GET"])
-def api_debug_db():
-    if not _db_ok:
-        with _buf_lock:
-            buf_size = len(_write_buf)
-        return jsonify({"db_ok": False, "error": "DB not connected", "buffer_pending": buf_size})
-    try:
-        conn = get_conn()
-        with conn.cursor() as cur:
-            cur.execute("SELECT COUNT(*) AS total FROM tick_logs")
-            total = cur.fetchone()["total"]
-            cur.execute("SELECT COUNT(DISTINCT symbol) AS syms FROM tick_logs")
-            syms = cur.fetchone()["syms"]
-        conn.close()
-        with _buf_lock:
-            buf_size = len(_write_buf)
-        return jsonify({"db_ok": True, "total_rows": total, "distinct_symbols": syms, "buffer_pending": buf_size})
-    except Exception as e:
-        return jsonify({"db_ok": False, "error": str(e)})
-
-
-@app.route("/api/health", methods=["GET"])
-def api_health():
-    """Diagnostic endpoint - shows whether data is flowing"""
-    with _tick_recv_lock:
-        cnt = _tick_recv_count
-        last = _last_tick_at
-    with quotes_lock:
-        syms = list(latest_quotes.keys())
-    return jsonify({
-        "status": "ok",
-        "ticks_received": cnt,
-        "last_tick_at": last,
-        "symbols_cached": len(syms),
-        "symbols": syms[:20],
-        "db_ok": _db_ok,
-        "db_host": MYSQL_HOST,
-    })
-
-
-# ==================== 最新状态 ====================
+# ==================== 最新状态接口 ====================
 @app.route("/api/latest_status", methods=["GET"])
 def api_latest_status():
-    sf = request.args.get("symbol", "").upper()
-    detail = None
-    latest_quote = None
-
+    sf = request.args.get("symbol", "").strip().upper()
+    detail = latest_quote = None
     if sf:
-        with quotes_lock:
-            q = latest_quotes.get(sf)
-            if q:
-                latest_quote = {
-                    "bid": q["bid"],
-                    "ask": q["ask"],
-                    "symbol": sf,
-                    "spread": q["spread"],
-                    "ts": q["ts"],
-                    "received_at": q["received_at"],
-                }
-
+        nk = normalize_symbol(sf)
+        with quote_cache_lock:
+            cq = latest_quote_cache.get(nk)
+        if cq:
+            latest_quote = dict(cq)
     with history_lock:
         sr = history_status[0] if history_status else None
         pr = history_positions[0] if history_positions else None
@@ -692,73 +342,61 @@ def api_latest_status():
         if not latest_quote:
             for record in history_report:
                 p = record.get("parsed")
-                if not isinstance(p, dict):
-                    continue
+                if not isinstance(p, dict): continue
                 if p.get("desc") == "QUOTE_DATA":
                     rs = p.get("symbol", "")
-                    if sf and not _symbol_matches(rs, sf):
-                        continue
-                    try:
-                        qd = json.loads(p.get("message", "{}"))
-                        if isinstance(qd, dict) and "bid" in qd:
-                            latest_quote = {
-                                "bid": qd["bid"],
-                                "ask": qd["ask"],
+                    if sf and not _symbol_matches(rs, sf): continue
+                    qd = _message_to_quote_dict(p)
+                    if not qd:
+                        try:
+                            qd = json.loads(p.get("message") or "{}")
+                        except Exception:
+                            qd = None
+                    if isinstance(qd, dict):
+                        b, a = _bid_ask_from_dict(qd)
+                        if b is not None and a is not None:
+                            latest_quote = {"bid": b, "ask": a,
                                 "symbol": normalize_symbol(rs) or rs,
-                                "spread": p.get("spread"),
-                                "ts": p.get("ts"),
-                                "received_at": record.get("received_at"),
-                            }
+                                "spread": p.get("spread"), "ts": p.get("ts"),
+                                "received_at": record.get("received_at")}
                             break
-                    except Exception:
-                        pass
 
-            if not latest_quote:
-                for record in history_report:
-                    p = record.get("parsed")
-                    if not isinstance(p, dict):
-                        continue
-                    rs = p.get("symbol", "")
-                    if sf and not _symbol_matches(rs, sf):
-                        continue
-                    if p.get("bid") is not None and p.get("ask") is not None:
-                        latest_quote = {
-                            "bid": p["bid"],
-                            "ask": p["ask"],
-                            "symbol": normalize_symbol(rs) or rs,
-                            "spread": p.get("spread"),
-                            "ts": p.get("ts"),
-                            "received_at": record.get("received_at"),
-                        }
+        if not latest_quote:
+            for record in history_report:
+                p = record.get("parsed")
+                if not isinstance(p, dict): continue
+                rs = p.get("symbol", "")
+                if sf and not _symbol_matches(rs, sf): continue
+                b, a = _bid_ask_from_dict(p)
+                if b is not None and a is not None:
+                    latest_quote = {"bid": b, "ask": a,
+                        "symbol": normalize_symbol(rs) or rs,
+                        "spread": p.get("spread"), "ts": p.get("ts"),
+                        "received_at": record.get("received_at")}
+                    break
+
+        if not latest_quote and sr:
+            pd = sr.get("parsed", {})
+            if sf:
+                for pos in (pd.get("positions") or []):
+                    if _symbol_matches(norm_str(pos.get("symbol","")), sf):
+                        latest_quote = {"bid":None,"ask":None,"symbol":sf,
+                            "spread":None,"ts":None,"received_at":sr.get("received_at")}
                         break
 
         if sr:
             pd = sr.get("parsed", {})
-            detail = {k: pd.get(k) for k in ["account", "server", "balance", "equity", "margin", "free_margin", "margin_level", "floating_pnl", "leverage_used"]}
+            detail = {k: pd.get(k) for k in ["account","server","balance","equity","margin","free_margin","margin_level","floating_pnl","leverage_used"]}
             detail["received_at"] = sr.get("received_at")
-            detail["positions"] = pd.get("positions") or (pr.get("parsed", {}).get("positions") if pr else [])
+            detail["positions"] = pd.get("positions") or (pr.get("parsed",{}).get("positions") if pr else [])
         elif pr:
             pd = pr.get("parsed", {})
-            detail = {
-                "received_at": pr.get("received_at"),
-                "account": pd.get("account"),
-                "server": pd.get("server"),
-                "positions": pd.get("positions") or [],
-            }
+            detail = {"received_at":pr.get("received_at"),"account":pd.get("account"),"server":pd.get("server"),
+                "positions":pd.get("positions") or []}
 
-    return jsonify({"detail": detail, "latest_quote": latest_quote})
+    return jsonify({"detail":detail,"latest_quote":latest_quote})
 
-
-@app.route("/api/quotes", methods=["GET"])
-def api_quotes():
-    with quotes_lock:
-        result = {}
-        for sym, q in latest_quotes.items():
-            result[sym] = {"bid": q["bid"], "ask": q["ask"], "spread": q["spread"], "ts": q["ts"], "received_at": q["received_at"]}
-    return jsonify(result)
-
-
-# ==================== MT4 原有接口 ====================
+# ==================== MT4 数据接收 ====================
 @app.route("/web/api/mt4/status", methods=["POST"])
 def mt4_status():
     store_mt4_data(request.get_data(as_text=True), get_client_ip(), dict(request.headers))
@@ -789,26 +427,59 @@ def mt4_commands():
     store_mt4_data(request.get_data(as_text=True), get_client_ip(), dict(request.headers))
     return jsonify({"commands": []}), 200
 
+# ==================== Tick 推送 ====================
+@app.route('/api/tick', methods=['POST'])
+def receive_tick():
+    try:
+        ticks = request.json
+        if not isinstance(ticks, list): ticks = [ticks]
+        for tick in ticks:
+            sym_raw = tick.get('symbol')
+            bid, ask = tick.get('bid'), tick.get('ask')
+            tt = tick.get('tick_time')
+            if not sym_raw or bid is None or ask is None:
+                continue
+            bf, af = _to_float(bid), _to_float(ask)
+            if bf is None or af is None:
+                continue
+            if tt is not None:
+                tft = float(tt)
+                ts_ms = int(tft) if tft > 1e12 else int(tft * 1000)
+            else:
+                ts_ms = int(time.time() * 1000)
+            update_kline(sym_raw, bf, af, ts_ms)
+            cache_tick_quote(sym_raw, bf, af, spread=tick.get('spread'), ts=tt)
+            record = {
+                "received_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "ip": get_client_ip(), "method": "POST", "path": "/api/tick",
+                "category": "report", "headers": {}, "body_raw": json.dumps(tick),
+                "parsed": {"desc":"QUOTE_DATA","spread":tick.get('spread',0),"ts":tt,
+                    "message":json.dumps({"bid":bf,"ask":af}),
+                    "symbol":sym_raw,"account":"tick_stream"}
+            }
+            with history_lock:
+                history_report.appendleft(record)
+        return '', 204
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
-# ==================== K线 & 产品 ====================
+# ==================== K线 & 产品接口 ====================
 @app.route("/api/kline", methods=["GET"])
 def api_kline():
     symbol = request.args.get("symbol", "XAUUSD").upper()
     tf = request.args.get("tf", "5min")
-    if tf not in KLINE_MAX:
-        tf = "5min"
+    if tf not in KLINE_MAX: tf = "5min"
     limit = min(request.args.get("limit", KLINE_MAX[tf], type=int), KLINE_MAX[tf])
     with get_kline_lock(symbol):
         bars = list(kline_data.get(symbol, {}).get(tf, []))
-    return jsonify({"symbol": symbol, "tf": tf, "bars": bars[-limit:]})
+    return jsonify({"symbol":symbol,"tf":tf,"bars":bars[-limit:]})
 
 @app.route("/api/products", methods=["GET"])
 def api_products():
     return jsonify(PRODUCT_SPECS)
 
-
 # ==================== 前端页面 ====================
-HTML_TEMPLATE = """<!doctype html>
+HTML_TEMPLATE = r"""<!doctype html>
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8"/>
@@ -819,21 +490,12 @@ HTML_TEMPLATE = """<!doctype html>
 <style>
 :root{--bg:#0b0e11;--card:#161a1e;--card2:#1e2329;--text:#eaecef;--muted:#5e6673;
 --line:#2b3139;--green:#0ecb81;--red:#f6465d;--yellow:#f0b90b;--accent:#f0b90b;
---safe-b:env(safe-area-inset-bottom);--grid:rgba(255,255,255,0.04);--cross:rgba(255,255,255,0.25);
---label-bg:#2b3139;--label-text:#eaecef;--empty-text:#5e6673;--modal-bg:rgba(0,0,0,.65)}
-:root.light{--bg:#f5f5f5;--card:#ffffff;--card2:#f0f0f0;--text:#1a1a2e;--muted:#6b7280;
---line:#e0e0e0;--green:#16a34a;--red:#dc2626;--yellow:#d97706;--accent:#2563eb;
---grid:rgba(0,0,0,0.06);--cross:rgba(0,0,0,0.2);--label-bg:#e5e7eb;--label-text:#1a1a2e;
---empty-text:#9ca3af;--modal-bg:rgba(0,0,0,.35)}
-:root.light .dot.ok{background:var(--green);box-shadow:0 0 6px var(--green)}
-:root.light .dot.err{background:var(--red);box-shadow:0 0 6px var(--red)}
-:root.light .sg.g{background:var(--green);box-shadow:0 0 4px var(--green)}
-:root.light .sg.y{background:var(--yellow);box-shadow:0 0 4px var(--yellow)}
-:root.light .sg.r{background:var(--red);box-shadow:0 0 4px var(--red)}
+--safe-b:env(safe-area-inset-bottom)}
 *{box-sizing:border-box;-webkit-tap-highlight-color:transparent;outline:none}
 html{font-size:16px}body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC",sans-serif;
-color:var(--text);background:var(--bg);line-height:1.5;overflow-x:hidden;transition:background .4s,color .4s}
-.app{width:100%;max-width:72rem;margin:0 auto;min-height:100vh;padding:1rem;padding-bottom:calc(1rem + var(--safe-b))}
+color:var(--text);background:var(--bg);line-height:1.5;overflow-x:hidden}
+.app{width:100%;max-width:72rem;margin:0 auto;min-height:100vh;padding:1rem;
+padding-bottom:calc(1rem + var(--safe-b))}
 .topbar{display:flex;align-items:center;justify-content:space-between;margin-bottom:.75rem}
 .logo{font-size:1.125rem;font-weight:700;color:var(--accent)}
 .conn{display:flex;align-items:center;gap:.4rem;font-size:.8rem;font-weight:600;color:var(--muted)}
@@ -847,7 +509,7 @@ color:var(--text);background:var(--bg);line-height:1.5;overflow-x:hidden;transit
 border:1px solid transparent;font-size:.8rem;cursor:pointer;transition:.2s}
 .tab:hover{color:var(--text)}.tab.on{background:var(--card2);color:var(--accent);border-color:var(--line)}
 .sr{display:flex;align-items:center;justify-content:space-between;margin-bottom:.75rem;
-background:var(--card);padding:.875rem 1.25rem;border-radius:.75rem;border:1px solid var(--line);transition:background .4s}
+background:var(--card);padding:.875rem 1.25rem;border-radius:.75rem;border:1px solid var(--line)}
 .clk{font-family:"SF Mono",Menlo,monospace;font-weight:700;color:var(--muted);font-size:1.25rem}
 .sc{display:flex;align-items:center;gap:.75rem}
 .sn{font-size:1.375rem;font-weight:800;letter-spacing:.5px}
@@ -858,7 +520,7 @@ color:var(--muted);font-weight:600;border:1px solid var(--line);cursor:pointer;t
 .ba-b{color:var(--green)}.ba-a{color:var(--red)}.ba-s{color:var(--muted);font-size:.75rem}
 .main{display:grid;grid-template-columns:280px 1fr;gap:.75rem;margin-bottom:.75rem}
 .pc{background:var(--card);border:1px solid var(--line);border-radius:.75rem;padding:1.25rem;
-display:flex;flex-direction:column;gap:1rem;transition:background .4s}
+display:flex;flex-direction:column;gap:1rem}
 .pm{text-align:center}
 .pv{font-size:2.25rem;font-weight:800;letter-spacing:-.5px;font-family:"SF Mono",monospace;transition:color .2s}
 .pv.up{color:var(--green)}.pv.down{color:var(--red)}
@@ -868,27 +530,25 @@ display:flex;flex-direction:column;gap:1rem;transition:background .4s}
 .pvv{font-size:1rem;font-weight:700;font-family:"SF Mono",monospace}
 .pvv.bid{color:var(--green)}.pvv.ask{color:var(--red)}
 .cp{background:var(--card);border:1px solid var(--line);border-radius:.75rem;display:flex;
-flex-direction:column;overflow:hidden;min-height:380px;transition:background .4s}
+flex-direction:column;overflow:hidden;min-height:380px}
 .ch{display:flex;align-items:center;justify-content:space-between;padding:.625rem 1rem;
 border-bottom:1px solid var(--line);flex-shrink:0}
-.ct{font-size:.8rem;font-weight:700;color:var(--muted)}.ci{font-size:.75rem;color:var(--muted);font-family:monospace}
+.ct{font-size:.8rem;font-weight:700;color:var(--muted)}
+.ci{font-size:.75rem;color:var(--muted);font-family:monospace}
 .tft{display:flex;gap:.25rem}
 .tf{padding:.2rem .625rem;border-radius:.25rem;border:1px solid var(--line);background:0;
 color:var(--muted);font-weight:600;font-size:.75rem;cursor:pointer;transition:.15s}
-.tf:hover{color:var(--text)}.tf.on{background:var(--accent);color:#fff;border-color:var(--accent)}
+.tf:hover{color:var(--text)}.tf.on{background:var(--accent);color:#000;border-color:var(--accent)}
 .cw{flex:1;position:relative;min-height:0;cursor:crosshair}
 #kc,#cc{position:absolute;inset:0;width:100%;height:100%}#cc{pointer-events:none}
 .stb{background:var(--card);border:1px solid var(--line);border-radius:.75rem;padding:.625rem 1rem;
-display:flex;justify-content:space-between;align-items:center;transition:background .4s}
+display:flex;justify-content:space-between;align-items:center}
 .si{display:flex;align-items:center;gap:.375rem;font-size:.75rem;font-weight:600;color:var(--muted)}
 .sg{width:.5rem;height:.5rem;border-radius:50%;display:inline-block}
 .sg.g{background:var(--green);box-shadow:0 0 4px var(--green)}
 .sg.y{background:var(--yellow);box-shadow:0 0 4px var(--yellow)}
 .sg.r{background:var(--red);box-shadow:0 0 4px var(--red)}
-.db-tag{font-size:.65rem;padding:.1rem .4rem;border-radius:.2rem;margin-left:.25rem;
-background:var(--card2);color:var(--muted);border:1px solid var(--line)}
-.db-tag.ok{color:var(--green);border-color:var(--green)}.db-tag.err{color:var(--red);border-color:var(--red)}
-.mask{position:fixed;inset:0;background:var(--modal-bg);display:none;align-items:center;
+.mask{position:fixed;inset:0;background:rgba(0,0,0,.65);display:none;align-items:center;
 justify-content:center;padding:1rem;z-index:100;backdrop-filter:blur(4px)}
 .mdl{width:min(24rem,100%);background:var(--card);border-radius:1rem;overflow:hidden;
 border:1px solid var(--line);box-shadow:0 20px 40px rgba(0,0,0,.4);animation:pop .2s ease-out;
@@ -901,21 +561,20 @@ border-bottom:1px solid var(--line);font-weight:700;font-size:1rem;flex-shrink:0
 align-items:center;border-radius:.5rem;cursor:pointer;transition:.1s;color:var(--muted)}
 .it:hover{background:var(--card2);color:var(--text)}.it.on{color:var(--accent)}
 .xb{background:0;border:0;color:var(--muted);font-size:1.25rem;cursor:pointer}
-.theme-tag{font-size:.65rem;padding:.15rem .4rem;border-radius:.2rem;background:var(--card2);
-color:var(--muted);border:1px solid var(--line);margin-left:.5rem;cursor:pointer}
 @media(max-width:768px){
-.main{grid-template-columns:1fr}.cp{min-height:320px}.sr{flex-wrap:wrap;gap:.5rem}
+.main{grid-template-columns:1fr}.cp{min-height:320px}
+.sr{flex-wrap:wrap;gap:.5rem}
 .mask{align-items:flex-end;padding:0}
 .mdl{width:100%;border-radius:1rem 1rem 0 0;animation:sU .25s ease-out;padding-bottom:var(--safe-b)}
-@keyframes sU{from{transform:translateY(100%)}to{transform:translateY(0)}}}
+@keyframes sU{from{transform:translateY(100%)}to{transform:translateY(0)}}
+}
 </style>
 </head>
 <body>
 <div class="app">
-<div class="topbar">
-<div class="logo">MT4 量化终端<span class="theme-tag" id="thTag" onclick="toggleTheme()">--</span></div>
-<div class="conn"><span id="cT">等待连接...</span><span class="dot" id="cD"></span><span class="db-tag" id="dbTag">DB --</span></div>
-</div>
+<div class="topbar"><div class="logo">MT4 量化终端</div>
+<div class="conn"><span id="cT">等待连接...</span><span class="dot" id="cD"></span></div></div>
+
 <div class="tw"><div class="tabs">
 <button class="tab on" onclick="stab(this,'forex')">外汇</button>
 <button class="tab" onclick="stab(this,'metal')">贵金属</button>
@@ -924,20 +583,24 @@ color:var(--muted);border:1px solid var(--line);margin-left:.5rem;cursor:pointer
 <button class="tab" onclick="stab(this,'crypto')">虚拟货币</button>
 <button class="tab" onclick="stab(this,'stock')">股票</button>
 </div></div>
+
 <div class="sr">
 <div class="clk" id="clk">--:--:--</div>
 <div class="sc"><span class="sn" id="sN">EURUSD</span><span class="sb" onclick="openM()">切换 ▾</span></div>
 <div class="ba"><span class="ba-b" id="bB">--</span><span class="ba-s">/</span><span class="ba-a" id="bA">--</span></div>
 </div>
+
 <div class="main">
 <div class="pc">
 <div class="pm"><span class="pv" id="mP">--</span></div>
 <div>
-<div class="pr"><span class="pl">Bid</span><span class="pvv bid" id="bP">--</span></div>
-<div class="pr"><span class="pl">Mid</span><span class="pvv" id="mP2">--</span></div>
-<div class="pr"><span class="pl">Ask</span><span class="pvv ask" id="aP">--</span></div>
+<div class="pr"><span class="pl">Bid（买入）</span><span class="pvv bid" id="bP">--</span></div>
+<div class="pr"><span class="pl">Mid（中间价）</span><span class="pvv" id="mP2">--</span></div>
+<div class="pr"><span class="pl">Ask（卖出）</span><span class="pvv ask" id="aP">--</span></div>
 <div class="pr"><span class="pl">点差</span><span class="pvv" id="sV" style="color:var(--accent)">--</span></div>
-</div></div>
+</div>
+</div>
+
 <div class="cp">
 <div class="ch">
 <div style="display:flex;align-items:center;gap:.75rem"><div class="ct">K 线图</div><div class="ci" id="oI"></div></div>
@@ -945,149 +608,200 @@ color:var(--muted);border:1px solid var(--line);margin-left:.5rem;cursor:pointer
 <button class="tf on" data-tf="5min" onclick="stf(this)">5m</button>
 <button class="tf" data-tf="10min" onclick="stf(this)">10m</button>
 <button class="tf" data-tf="1hour" onclick="stf(this)">1H</button>
-</div></div>
+</div>
+</div>
 <div class="cw" id="cW"><canvas id="kc"></canvas><canvas id="cc"></canvas></div>
-</div></div>
+</div>
+</div>
+
 <div class="stb">
 <div class="si"><span class="sg g" id="lS"></span><span id="lT">延迟: --</span></div>
 <div class="si"><span id="sT">点差: --</span></div>
 <div class="si"><span id="uT">数据: --</span></div>
-</div></div>
+</div>
+</div>
+
 <div class="mask" id="msk" onclick="if(event.target.id==='msk')msk.style.display='none'">
 <div class="mdl"><div class="mh"><span id="mTi">切换品种</span><button class="xb" onclick="msk.style.display='none'">✕</button></div>
-<div class="mb" id="mLi"></div></div></div>
+<div class="mb" id="mLi"></div></div>
+</div>
+
 <script>
 const $=id=>document.getElementById(id);
-const CP={forex:["EURUSD","GBPUSD","USDJPY","USDCHF","AUDUSD","USDCAD","NZDUSD","EURGBP","EURJPY","GBPJPY","AUDJPY","EURAUD","EURCHF","GBPCHF","CHFJPY","CADJPY","AUDNZD","AUDCAD","AUDCHF","EURNZD","EURCAD","CADCHF","NZDJPY","GBPAUD","GBPCAD","GBPNZD","NZDCAD","NZDCHF","USDSGD","USDHKD","USDCNH"],metal:["XAUUSD","XAGUSD"],commodity:["UKOUSD","USOUSD"],index:["U30USD","NASUSD","SPXUSD","100GBP","D30EUR","E50EUR","H33HKD"],crypto:["BTCUSD","ETHUSD","LTCUSD","BCHUSD","XMRUSD","BNBUSD","SOLUSD","ADAUSD","DOGUSD","XSIUSD","AVEUSD","DSHUSD","RPLUSD","LNKUSD"],stock:["AAPL","AMZN","BABA","GOOGL","META","MSFT","NFLX","NVDA","TSLA","ABBV","ABNB","ABT","ADBE","AMD","AVGO","C","CRM","DIS","GS","INTC","JNJ","MA","MCD","KO","MMM","NIO","PLTR","SHOP","TSM","V"]};
+const CP={
+forex:["EURUSD","GBPUSD","USDJPY","USDCHF","AUDUSD","USDCAD","NZDUSD","EURGBP","EURJPY","GBPJPY","AUDJPY","EURAUD","EURCHF","GBPCHF","CHFJPY","CADJPY","AUDNZD","AUDCAD","AUDCHF","EURNZD","EURCAD","CADCHF","NZDJPY","GBPAUD","GBPCAD","GBPNZD","NZDCAD","NZDCHF","USDSGD","USDHKD","USDCNH"],
+metal:["XAUUSD","XAGUSD"],commodity:["UKOUSD","USOUSD"],
+index:["U30USD","NASUSD","SPXUSD","100GBP","D30EUR","E50EUR","H33HKD"],
+crypto:["BTCUSD","ETHUSD","LTCUSD","BCHUSD","XMRUSD","BNBUSD","SOLUSD","ADAUSD","DOGUSD","XSIUSD","AVEUSD","DSHUSD","RPLUSD","LNKUSD"],
+stock:["AAPL","AMZN","BABA","GOOGL","META","MSFT","NFLX","NVDA","TSLA","ABBV","ABNB","ABT","ADBE","AMD","AVGO","C","CRM","DIS","GS","INTC","JNJ","MA","MCD","KO","MMM","NIO","PLTR","SHOP","TSM","V"]
+};
 const CN={forex:"外汇",metal:"贵金属",commodity:"大宗商品",index:"指数",crypto:"虚拟货币",stock:"股票"};
-let S="EURUSD",C="forex",TF="5min",lastM=null,stag=0,sigP=0,cBars=[],L=null,themeManual=null;
-function getUTC8Hour(){return new Date(Date.now()+8*3600000).getUTCHours()}
-function isDarkTime(){const h=getUTC8Hour();return h>=20||h<6}
-function applyTheme(){let dark;if(themeManual!==null)dark=(themeManual==='dark');else dark=isDarkTime();
-const root=document.documentElement;if(dark){root.classList.remove('light');$('thTag').innerText='夜间'}
-else{root.classList.add('light');$('thTag').innerText='日间'}
-const meta=document.querySelector('meta[name="theme-color"]');if(meta)meta.content=dark?'#0b0e11':'#f5f5f5'}
-function toggleTheme(){if(themeManual===null)themeManual=isDarkTime()?'light':'dark';
-else if(themeManual==='dark')themeManual='light';else themeManual=null;applyTheme()}
-applyTheme();setInterval(applyTheme,60000);
+let S="EURUSD",C="forex",TF="5min",lastM=null,stag=0,sigP=0,cBars=[],L=null;
+
 function dg(s){if(!s)return 2;const u=s.toUpperCase();
-if(["XAUUSD","XAGUSD","UKOUSD","USOUSD","BTCUSD","ETHUSD"].includes(u))return 2;
+if(u==="XAUUSD"||u==="XAGUSD"||u==="UKOUSD"||u==="USOUSD")return 2;
+if(u==="BTCUSD"||u==="ETHUSD")return 2;
 if(u.endsWith("JPY"))return 3;
 if(["DOGUSD","ADAUSD","RPLUSD","XSIUSD","LNKUSD"].includes(u))return 5;
 if(["LTCUSD","SOLUSD","BCHUSD","XMRUSD","BNBUSD","AVEUSD","DSHUSD"].includes(u))return 2;
 if(["U30USD","NASUSD","SPXUSD","100GBP","D30EUR","E50EUR","H33HKD"].includes(u))return 1;
+// 股票: 没有典型外汇后缀
 const fx=["USD","GBP","EUR","JPY","CHF","AUD","NZD","CAD","HKD","SGD","CNH"];
-if(!fx.some(c=>u.includes(c)))return 2;return 5}
+if(!fx.some(c=>u.includes(c)))return 2;
+return 5;}
 function fm(n,d){return n!=null?parseFloat(n).toFixed(d):'--'}
-function nS(lo,hi,mt){if(lo===hi){const d=lo===0?1:Math.abs(lo)*.01;lo-=d;hi+=d}
-const r=hi-lo,p=r*.08;let mn=lo-p,mx=hi+p;const rs=(mx-mn)/(mt-1),mg=Math.pow(10,Math.floor(Math.log10(rs))),res=rs/mg;
-let ns;if(res<=1)ns=mg;else if(res<=2)ns=2*mg;else if(res<=2.5)ns=2.5*mg;else if(res<=5)ns=5*mg;else ns=10*mg;
-const tI=Math.floor(mn/ns)*ns,tA=Math.ceil(mx/ns)*ns,tk=[];for(let v=tI;v<=tA+ns*.5;v+=ns)tk.push(v);return{tI,tA,ns,tk}}
+
+function nS(lo,hi,mt){
+if(lo===hi){const d=lo===0?1:Math.abs(lo)*.01;lo-=d;hi+=d}
+const r=hi-lo,p=r*.08;let mn=lo-p,mx=hi+p;
+const rs=(mx-mn)/(mt-1),mg=Math.pow(10,Math.floor(Math.log10(rs))),res=rs/mg;
+let ns;if(res<=1)ns=mg;else if(res<=2)ns=2*mg;else if(res<=2.5)ns=2.5*mg;
+else if(res<=5)ns=5*mg;else ns=10*mg;
+const tI=Math.floor(mn/ns)*ns,tA=Math.ceil(mx/ns)*ns,tk=[];
+for(let v=tI;v<=tA+ns*.5;v+=ns)tk.push(v);
+return{tI,tA,ns,tk}}
+
 function tick(){const n=new Date();$('clk').innerText=[n.getHours(),n.getMinutes(),n.getSeconds()].map(v=>String(v).padStart(2,'0')).join(':')}
 function stab(b,c){document.querySelectorAll('.tab').forEach(t=>t.classList.remove('on'));b.classList.add('on');C=c}
-function openM(){$('mTi').innerText='切换'+(CN[C]||'品种');$('mLi').innerHTML=(CP[C]||[]).map(s=>'<div class="it '+(s===S?'on':'')+'" onclick="pick(\''+s+'\')"><span>'+s+'</span></div>').join('');$('msk').style.display='flex'}
-function pick(s){S=s;$('sN').innerText=s;$('msk').style.display='none';['bP','aP','mP','mP2','sV','bB','bA'].forEach(function(id){if($(id))$(id).innerText='--'});$('sT').innerText='点差: --';lastM=null;stag=0;drawE();rf();fK()}
-async function rf(){try{const r=await fetch('/api/latest_status?symbol='+S),d=await r.json();cOk(true);
+function openM(){$('mTi').innerText='切换'+(CN[C]||'品种');
+$('mLi').innerHTML=(CP[C]||[]).map(s=>`<div class="it ${s===S?'on':''}" onclick="pick('${s}')"><span>${s}</span></div>`).join('');
+$('msk').style.display='flex'}
+function pick(s){S=s;$('sN').innerText=s;$('msk').style.display='none';
+['bP','aP','mP','mP2','sV','bB','bA'].forEach(id=>{if($(id))$(id).innerText='--'});
+$('sT').innerText='点差: --';lastM=null;stag=0;drawE();rf();fK()}
+
+async function rf(){try{
+const r=await fetch('/api/latest_status?symbol='+encodeURIComponent(S)),d=await r.json();
+cOk(true);
 if(d.latest_quote){const q=d.latest_quote,D=dg(S);
-if(q.bid!=null&&q.ask!=null){const mid=(q.bid+q.ask)/2,prev=lastM;lastM=mid;
-$('bP').innerText=fm(q.bid,D);$('aP').innerText=fm(q.ask,D);$('mP').innerText=fm(mid,D);$('mP2').innerText=fm(mid,D);
-$('bB').innerText=fm(q.bid,D);$('bA').innerText=fm(q.ask,D);
+const b=Number(q.bid),a=Number(q.ask);
+if(Number.isFinite(b)&&Number.isFinite(a)){
+const mid=(b+a)/2,prev=lastM;lastM=mid;
+$('bP').innerText=fm(b,D);$('aP').innerText=fm(a,D);
+$('mP').innerText=fm(mid,D);$('mP2').innerText=fm(mid,D);
+$('bB').innerText=fm(b,D);$('bA').innerText=fm(a,D);
 const pe=$('mP');pe.classList.remove('up','down');
 if(prev!=null){if(mid>prev)pe.classList.add('up');else if(mid<prev)pe.classList.add('down')}
-const sp=q.spread!=null?q.spread:((q.ask-q.bid)*Math.pow(10,D>2?0:(5-D))).toFixed(1);
+const sp=q.spread!=null?q.spread:((a-b)*Math.pow(10,D>2?0:(5-D))).toFixed(1);
 $('sV').innerText=sp;$('sT').innerText='点差: '+sp}
-const now=Date.now();
-if(q.ts!=null){const sMs=q.ts<1e12?q.ts*1000:q.ts,lat=Math.round(now-sMs-8*3600000);
-$('lT').innerText='延迟: '+lat+'ms';lSig(lat);
-const dt=new Date(sMs+8*3600000);
-$('uT').innerText='数据: '+[dt.getUTCMonth()+1,dt.getUTCDate()].map(v=>String(v).padStart(2,'0')).join('-')+' '+[dt.getUTCHours(),dt.getUTCMinutes(),dt.getUTCSeconds()].map(v=>String(v).padStart(2,'0')).join(':')}
+if(q.ts!=null){const t=Number(q.ts),sMs=t<1e12?t*1000:t,now=Date.now(),lat=Math.round(now-sMs);
+if(Number.isFinite(sMs)&&Number.isFinite(lat)&&Math.abs(lat)<=600000){$('lT').innerText='延迟: '+lat+'ms';lSig(lat)}
+else{$('lT').innerText='延迟: --';lSig(99999)}
+const dt=new Date(sMs);
+$('uT').innerText='数据: '+dt.toLocaleString('zh-CN',{hour12:false,timeZone:'Asia/Shanghai',year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit'}).replace(/\//g,'-')}
 else if(q.received_at)$('uT').innerText='更新: '+(q.received_at.split(' ')[1]||'--')
 }}catch(e){console.error(e);cOk(false)}}
-async function fK(){try{const lm={_5min:300,_10min:250,_1hour:200};
-const r=await fetch('/api/kline?symbol='+S+'&tf='+TF+'&limit='+(lm['_'+TF]||300)),d=await r.json();
-if(d.bars&&d.bars.length>0){cBars=d.bars;drawK(d.bars)}else{cBars=[];drawE()}}catch(e){drawE()}}
+
+async function fK(){try{
+const lm={_5min:300,_10min:250,_1hour:200};
+const r=await fetch('/api/kline?symbol='+encodeURIComponent(S)+'&tf='+encodeURIComponent(TF)+'&limit='+(lm['_'+TF]||300)),d=await r.json();
+if(d.bars&&d.bars.length>0){cBars=d.bars;drawK(d.bars)}else{cBars=[];drawE()}
+}catch(e){drawE()}}
 function stf(b){document.querySelectorAll('.tf').forEach(t=>t.classList.remove('on'));b.classList.add('on');TF=b.dataset.tf;fK()}
-function cv(name){return getComputedStyle(document.documentElement).getPropertyValue(name).trim()}
-function drawK(bars){const cvs=$('kc');if(!cvs)return;const ctx=cvs.getContext('2d');
-const dpr=devicePixelRatio||1,w=cvs.offsetWidth,h=cvs.offsetHeight;
-if(w<=0||h<=0)return;cvs.width=w*dpr;cvs.height=h*dpr;ctx.scale(dpr,dpr);ctx.clearRect(0,0,w,h);
+
+// ========== K线绘制 ==========
+function drawK(bars){
+const cv=$('kc');if(!cv)return;const ctx=cv.getContext('2d');
+const dpr=devicePixelRatio||1,w=cv.offsetWidth,h=cv.offsetHeight;
+if(w<=0||h<=0)return;cv.width=w*dpr;cv.height=h*dpr;ctx.scale(dpr,dpr);ctx.clearRect(0,0,w,h);
 if(!bars||!bars.length){drawE();return}
-const G=cv('--green')||'#0ecb81',R=cv('--red')||'#f6465d',gridC=cv('--grid'),axC=cv('--muted');
-const PL=8,PR=72,PT=16,PB=24,cW=w-PL-PR,cH=h-PT-PB;if(cW<=0||cH<=0)return;
-const df={_5min:80,_10min:60,_1hour:48};let vn=Math.min(df['_'+TF]||80,bars.length,Math.floor(cW/6));
-vn=Math.max(vn,Math.min(20,bars.length));const vb=bars.slice(-vn),n=vb.length;if(!n)return;
-let dMin=Infinity,dMax=-Infinity;for(const b of vb){if(b[2]>dMax)dMax=b[2];if(b[3]<dMin)dMin=b[3]}
+const PL=8,PR=72,PT=16,PB=24,cW=w-PL-PR,cH=h-PT-PB;
+if(cW<=0||cH<=0)return;
+const df={_5min:80,_10min:60,_1hour:48};
+let vn=Math.min(df['_'+TF]||80,bars.length,Math.floor(cW/6));
+vn=Math.max(vn,Math.min(20,bars.length));
+const vb=bars.slice(-vn),n=vb.length;if(!n)return;
+let dMin=Infinity,dMax=-Infinity;
+for(const b of vb){if(b[2]>dMax)dMax=b[2];if(b[3]<dMin)dMin=b[3]}
 const D=dg(S),sc=nS(dMin,dMax,6),yI=sc.tI,yA=sc.tA,yR=yA-yI||1;
 const p2y=p=>PT+cH*(1-(p-yI)/yR),y2p=y=>yI+(1-(y-PT)/cH)*yR;
 const bT=cW/n,gap=Math.max(1,Math.round(bT*.2)),bW=Math.max(1,Math.floor(bT-gap)),hB=bW/2;
-const bx=i=>PL+(i+.5)*bT;L={PL,PR,PT,PB,cW,cH,n,bT,yI,yA,yR,p2y,y2p,bx,D,vb};
+const bx=i=>PL+(i+.5)*bT;
+L={PL,PR,PT,PB,cW,cH,n,bT,yI,yA,yR,p2y,y2p,bx,D,vb};
+const G='#0ecb81',R='#f6465d',gr='rgba(255,255,255,0.04)',ax='#5e6673';
+// Y轴
 ctx.font='11px "SF Mono",Menlo,monospace';ctx.textAlign='left';ctx.textBaseline='middle';
 for(const t of sc.tk){const y=p2y(t);if(y<PT-2||y>PT+cH+2)continue;
-ctx.strokeStyle=gridC;ctx.lineWidth=1;ctx.beginPath();ctx.moveTo(PL,Math.round(y)+.5);ctx.lineTo(PL+cW,Math.round(y)+.5);ctx.stroke();
-ctx.fillStyle=axC;ctx.fillText(t.toFixed(D),PL+cW+8,y)}
+ctx.strokeStyle=gr;ctx.lineWidth=1;ctx.beginPath();ctx.moveTo(PL,Math.round(y)+.5);ctx.lineTo(PL+cW,Math.round(y)+.5);ctx.stroke();
+ctx.fillStyle=ax;ctx.fillText(t.toFixed(D),PL+cW+8,y)}
+// 烛台
 for(let i=0;i<n;i++){const b=vb[i],o=b[1],hi=b[2],lo=b[3],cl=b[4];
 const up=cl>=o,col=up?G:R,x=bx(i);
-ctx.strokeStyle=col;ctx.lineWidth=1;ctx.beginPath();ctx.moveTo(Math.round(x)+.5,Math.round(p2y(hi)));ctx.lineTo(Math.round(x)+.5,Math.round(p2y(lo)));ctx.stroke();
+ctx.strokeStyle=col;ctx.lineWidth=1;ctx.beginPath();
+ctx.moveTo(Math.round(x)+.5,Math.round(p2y(hi)));ctx.lineTo(Math.round(x)+.5,Math.round(p2y(lo)));ctx.stroke();
 const yO=p2y(o),yC=p2y(cl),bt=Math.min(yO,yC),bb=Math.max(yO,yC);
 ctx.fillStyle=col;ctx.fillRect(Math.round(x-hB),Math.round(bt),bW,Math.max(1,bb-bt))}
+// 最新价虚线
 if(n>0){const lc=vb[n-1][4],up=lc>=vb[n-1][1],col=up?G:R,yL=p2y(lc);
-ctx.setLineDash([4,3]);ctx.strokeStyle=col;ctx.lineWidth=1;ctx.beginPath();ctx.moveTo(PL,Math.round(yL)+.5);ctx.lineTo(PL+cW,Math.round(yL)+.5);ctx.stroke();ctx.setLineDash([]);
+ctx.setLineDash([4,3]);ctx.strokeStyle=col;ctx.lineWidth=1;
+ctx.beginPath();ctx.moveTo(PL,Math.round(yL)+.5);ctx.lineTo(PL+cW,Math.round(yL)+.5);ctx.stroke();ctx.setLineDash([]);
 const tW=PR-6,tH=18,tX=PL+cW+2,tY=Math.round(yL)-tH/2;
 ctx.fillStyle=col;ctx.beginPath();ctx.roundRect(tX,tY,tW,tH,3);ctx.fill();
 ctx.fillStyle='#fff';ctx.font='bold 11px "SF Mono",Menlo,monospace';ctx.textAlign='center';ctx.textBaseline='middle';
 ctx.fillText(lc.toFixed(D),tX+tW/2,Math.round(yL))}
-ctx.fillStyle=axC;ctx.font='10px "SF Mono",Menlo,monospace';ctx.textAlign='center';ctx.textBaseline='top';
+// X轴
+ctx.fillStyle=ax;ctx.font='10px "SF Mono",Menlo,monospace';ctx.textAlign='center';ctx.textBaseline='top';
 const mG=60,iMs=TF==='1hour'?3600000*4:TF==='10min'?3600000:1800000;let lX=-Infinity;
 for(let i=0;i<n;i++){const ts=vb[i][0],x=bx(i);
 if(ts%iMs!==0&&i!==0&&i!==n-1)continue;if(x-lX<mG)continue;
 const d=new Date(ts+8*3600000);let lb;
 if(TF==='1hour')lb=(d.getUTCMonth()+1)+'/'+d.getUTCDate()+' '+String(d.getUTCHours()).padStart(2,'0')+':00';
 else lb=String(d.getUTCHours()).padStart(2,'0')+':'+String(d.getUTCMinutes()).padStart(2,'0');
-ctx.strokeStyle=gridC;ctx.lineWidth=1;ctx.beginPath();ctx.moveTo(Math.round(x)+.5,PT+cH);ctx.lineTo(Math.round(x)+.5,PT+cH+4);ctx.stroke();
-ctx.fillStyle=axC;ctx.fillText(lb,x,PT+cH+6);lX=x}clrCH()}
-function drawE(){const cvs=$('kc');if(!cvs)return;const ctx=cvs.getContext('2d'),dpr=devicePixelRatio||1,w=cvs.offsetWidth,h=cvs.offsetHeight;
-cvs.width=w*dpr;cvs.height=h*dpr;ctx.scale(dpr,dpr);ctx.clearRect(0,0,w,h);
-ctx.fillStyle=cv('--empty-text')||'#5e6673';ctx.font='13px sans-serif';ctx.textAlign='center';ctx.textBaseline='middle';
+ctx.strokeStyle=gr;ctx.lineWidth=1;ctx.beginPath();ctx.moveTo(Math.round(x)+.5,PT+cH);ctx.lineTo(Math.round(x)+.5,PT+cH+4);ctx.stroke();
+ctx.fillStyle=ax;ctx.fillText(lb,x,PT+cH+6);lX=x}
+clrCH()}
+
+function drawE(){const cv=$('kc');if(!cv)return;const ctx=cv.getContext('2d'),dpr=devicePixelRatio||1,w=cv.offsetWidth,h=cv.offsetHeight;
+cv.width=w*dpr;cv.height=h*dpr;ctx.scale(dpr,dpr);ctx.clearRect(0,0,w,h);
+ctx.fillStyle='#5e6673';ctx.font='13px sans-serif';ctx.textAlign='center';ctx.textBaseline='middle';
 ctx.fillText('暂无 K 线数据',w/2,h/2);clrCH();L=null}
-function clrCH(){const cvs=$('cc');if(!cvs)return;const dpr=devicePixelRatio||1,w=cvs.offsetWidth,h=cvs.offsetHeight;
-cvs.width=w*dpr;cvs.height=h*dpr;cvs.getContext('2d').scale(dpr,dpr);$('oI').innerText=''}
-function dCH(mx,my){const cvs=$('cc');if(!cvs||!L)return;
-const dpr=devicePixelRatio||1,w=cvs.offsetWidth,h=cvs.offsetHeight;
-cvs.width=w*dpr;cvs.height=h*dpr;const ctx=cvs.getContext('2d');ctx.scale(dpr,dpr);
+
+// ===== 十字光标 =====
+function clrCH(){const cv=$('cc');if(!cv)return;const dpr=devicePixelRatio||1,w=cv.offsetWidth,h=cv.offsetHeight;
+cv.width=w*dpr;cv.height=h*dpr;cv.getContext('2d').scale(dpr,dpr);$('oI').innerText=''}
+function dCH(mx,my){const cv=$('cc');if(!cv||!L)return;
+const dpr=devicePixelRatio||1,w=cv.offsetWidth,h=cv.offsetHeight;
+cv.width=w*dpr;cv.height=h*dpr;const ctx=cv.getContext('2d');ctx.scale(dpr,dpr);
 const{PL,PT,cW,cH,n,bT,D,vb,p2y,y2p,bx}=L;
-const crossC=cv('--cross'),lblBg=cv('--label-bg'),lblTx=cv('--label-text');
 const cx=Math.max(PL,Math.min(mx,PL+cW)),cy=Math.max(PT,Math.min(my,PT+cH));
 const idx=Math.max(0,Math.min(Math.round((cx-PL)/bT-.5),n-1)),sx=bx(idx);
-ctx.setLineDash([3,3]);ctx.strokeStyle=crossC;ctx.lineWidth=1;
+ctx.setLineDash([3,3]);ctx.strokeStyle='rgba(255,255,255,0.25)';ctx.lineWidth=1;
 ctx.beginPath();ctx.moveTo(Math.round(sx)+.5,PT);ctx.lineTo(Math.round(sx)+.5,PT+cH);ctx.stroke();
-ctx.beginPath();ctx.moveTo(PL,Math.round(cy)+.5);ctx.lineTo(PL+cW,Math.round(cy)+.5);ctx.stroke();ctx.setLineDash([]);
-const pr=y2p(cy);ctx.fillStyle=lblBg;
+ctx.beginPath();ctx.moveTo(PL,Math.round(cy)+.5);ctx.lineTo(PL+cW,Math.round(cy)+.5);ctx.stroke();
+ctx.setLineDash([]);
+const pr=y2p(cy);ctx.fillStyle='#2b3139';
 const tW2=64,tH2=18,tX2=PL+cW+2,tY2=Math.round(cy)-tH2/2;
 ctx.beginPath();ctx.roundRect(tX2,tY2,tW2,tH2,3);ctx.fill();
-ctx.fillStyle=lblTx;ctx.font='11px "SF Mono",Menlo,monospace';ctx.textAlign='center';ctx.textBaseline='middle';
+ctx.fillStyle='#eaecef';ctx.font='11px "SF Mono",Menlo,monospace';ctx.textAlign='center';ctx.textBaseline='middle';
 ctx.fillText(pr.toFixed(D),tX2+tW2/2,Math.round(cy));
 if(idx>=0&&idx<n){const b=vb[idx],ts=b[0],d=new Date(ts+8*3600000);
 let lb;if(TF==='1hour')lb=(d.getUTCMonth()+1)+'/'+d.getUTCDate()+' '+String(d.getUTCHours()).padStart(2,'0')+':00';
 else lb=String(d.getUTCHours()).padStart(2,'0')+':'+String(d.getUTCMinutes()).padStart(2,'0');
 const tw=ctx.measureText(lb).width+12,tx=Math.round(sx)-tw/2,ty=PT+cH+2;
-ctx.fillStyle=lblBg;ctx.beginPath();ctx.roundRect(tx,ty,tw,16,3);ctx.fill();
-ctx.fillStyle=lblTx;ctx.font='10px "SF Mono",Menlo,monospace';ctx.textAlign='center';ctx.textBaseline='top';
+ctx.fillStyle='#2b3139';ctx.beginPath();ctx.roundRect(tx,ty,tw,16,3);ctx.fill();
+ctx.fillStyle='#eaecef';ctx.font='10px "SF Mono",Menlo,monospace';ctx.textAlign='center';ctx.textBaseline='top';
 ctx.fillText(lb,Math.round(sx),ty+2);
-const o=b[1],hi=b[2],lo=b[3],cl=b[4],up=cl>=o;
-const c2=up?(cv('--green')||'#0ecb81'):(cv('--red')||'#f6465d');
-$('oI').innerHTML='<span style="color:'+c2+'">O:'+o.toFixed(D)+' H:'+hi.toFixed(D)+' L:'+lo.toFixed(D)+' C:'+cl.toFixed(D)+'</span>'}}
+const o=b[1],hi=b[2],lo=b[3],cl=b[4],up=cl>=o,c2=up?'#0ecb81':'#f6465d';
+$('oI').innerHTML=`<span style="color:${c2}">O:${o.toFixed(D)} H:${hi.toFixed(D)} L:${lo.toFixed(D)} C:${cl.toFixed(D)}</span>`}}
+
 (function(){const wr=$('cW');if(!wr)return;
 function pos(e){const r=wr.getBoundingClientRect();return e.touches?{x:e.touches[0].clientX-r.left,y:e.touches[0].clientY-r.top}:{x:e.clientX-r.left,y:e.clientY-r.top}}
-wr.addEventListener('mousemove',function(e){var p=pos(e);dCH(p.x,p.y)});
-wr.addEventListener('mouseleave',function(){clrCH()});
-wr.addEventListener('touchmove',function(e){e.preventDefault();var p=pos(e);dCH(p.x,p.y)},{passive:false});
-wr.addEventListener('touchend',function(){clrCH()})})();
-function lSig(v){const s=$('lS');if(!s)return;s.className='sg';if(v<500)s.classList.add('g');else if(v<2000)s.classList.add('y');else s.classList.add('r')}
-function cOk(ok){const d=$('cD'),t=$('cT');if(!d||!t)return;d.className='dot';if(ok){d.classList.add('ok');t.innerText='已连接'}else{d.classList.add('err');t.innerText='连接断开'}}
-function chkS(){const p=parseFloat(($('mP')||{}).innerText)||0;if(sigP===p&&p>0){stag++;if(stag>=5){const s=$('lS');if(s){s.className='sg';s.classList.add('r')}$('lT').innerText='数据停滞!'}}else stag=0;sigP=p}
-async function chkDB(){try{const r=await fetch('/api/debug/db'),d=await r.json();const tag=$('dbTag');if(!tag)return;if(d.db_ok){tag.className='db-tag ok';tag.innerText='DB '+d.total_rows}else{tag.className='db-tag err';tag.innerText='DB x'}}catch(e){const tag=$('dbTag');if(tag){tag.className='db-tag err';tag.innerText='DB x'}}}
-tick();setInterval(tick,1000);rf();setInterval(rf,2000);setInterval(chkS,2000);fK();setInterval(fK,2000);chkDB();setInterval(chkDB,15000);
-addEventListener('resize',function(){clearTimeout(window._rt);window._rt=setTimeout(function(){if(cBars.length)drawK(cBars);else drawE()},100)});
+wr.addEventListener('mousemove',e=>{const p=pos(e);dCH(p.x,p.y)});
+wr.addEventListener('mouseleave',()=>clrCH());
+wr.addEventListener('touchmove',e=>{e.preventDefault();const p=pos(e);dCH(p.x,p.y)},{passive:false});
+wr.addEventListener('touchend',()=>clrCH())})();
+
+function lSig(v){const s=$('lS');if(!s)return;s.className='sg';
+if(v<500)s.classList.add('g');else if(v<2000)s.classList.add('y');else s.classList.add('r')}
+function cOk(ok){const d=$('cD'),t=$('cT');if(!d||!t)return;d.className='dot';
+if(ok){d.classList.add('ok');t.innerText='已连接'}else{d.classList.add('err');t.innerText='连接断开'}}
+function chkS(){const p=parseFloat($('mP')?.innerText)||0;
+if(sigP===p&&p>0){stag++;if(stag>=5){const s=$('lS');if(s){s.className='sg';s.classList.add('r')}$('lT').innerText='数据停滞!'}}
+else stag=0;sigP=p}
+
+tick();setInterval(tick,1000);rf();setInterval(rf,2000);setInterval(chkS,2000);
+fK();setInterval(fK,2000);
+addEventListener('resize',()=>{clearTimeout(window._rt);window._rt=setTimeout(()=>{if(cBars.length)drawK(cBars);else drawE()},100)});
 </script>
 </body></html>
 """
@@ -1096,8 +810,6 @@ addEventListener('resize',function(){clearTimeout(window._rt);window._rt=setTime
 def index():
     return render_template_string(HTML_TEMPLATE)
 
-
-# ==================== 启动 ====================
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=True)
