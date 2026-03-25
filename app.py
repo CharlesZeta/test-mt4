@@ -5,6 +5,19 @@ import traceback
 import time
 import re
 from datetime import datetime
+from zoneinfo import ZoneInfo
+
+# ==================== 东八区时间工具 ====================
+SH_TZ = ZoneInfo("Asia/Shanghai")
+
+def now_shanghai_dt():
+    """返回东八区当前 datetime 对象"""
+    return datetime.now(SH_TZ)
+
+def now_shanghai_str():
+    """返回东八区时间字符串，精确到毫秒"""
+    return now_shanghai_dt().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+
 from collections import deque
 from flask import Flask, request, render_template_string, jsonify
 
@@ -57,7 +70,9 @@ def init_db():
         return
     try:
         conn = get_conn()
+        print(f"[DB] connecting to {MYSQL_HOST}:{MYSQL_PORT} as {MYSQL_USER} / db={MYSQL_DB}")
         with conn.cursor() as cur:
+            # 原有 tick_logs 表
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS tick_logs (
                     id BIGINT AUTO_INCREMENT PRIMARY KEY,
@@ -70,9 +85,34 @@ def init_db():
                     INDEX idx_time (tick_time)
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
             """)
+            # ---- 新增：简化报价历史表（5字段模板）----
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS quote_ticks (
+                    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                    symbol VARCHAR(20) NOT NULL,
+                    bid DOUBLE NOT NULL,
+                    ask DOUBLE NOT NULL,
+                    spread DOUBLE DEFAULT 0,
+                    received_at DATETIME(3) NOT NULL,
+                    INDEX idx_symbol_time (symbol, received_at),
+                    INDEX idx_received_at (received_at)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """)
+            # ---- 新增：最新报价快照表（每个 symbol 只保留一条）----
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS latest_quotes (
+                    symbol VARCHAR(20) PRIMARY KEY,
+                    bid DOUBLE NOT NULL,
+                    ask DOUBLE NOT NULL,
+                    spread DOUBLE DEFAULT 0,
+                    received_at DATETIME(3) NOT NULL
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """)
         conn.close()
         _db_ok = True
         print("[DB] tick_logs ready")
+        print("[DB] quote_ticks ready (5-field template)")
+        print("[DB] latest_quotes ready (snapshot)")
     except Exception as e:
         _db_ok = False
         print(f"[DB] init failed: {e}")
@@ -104,17 +144,29 @@ def _flush_buf():
 
 def _do_insert(batch):
     global _db_ok
+    if not batch:
+        return
     try:
         conn = get_conn()
         with conn.cursor() as cur:
+            # 1) 批量写入 quote_ticks（历史表）
+            rows = [(r["symbol"], r["bid"], r["ask"], r["spread"], r["received_at"]) for r in batch]
             cur.executemany(
-                "INSERT INTO tick_logs (symbol,bid,ask,spread,mid,tick_time,received_at) "
-                "VALUES (%s,%s,%s,%s,%s,%s,%s)", batch)
+                "INSERT INTO quote_ticks (symbol,bid,ask,spread,received_at) "
+                "VALUES (%s,%s,%s,%s,%s)", rows)
+            # 2) Upsert 到 latest_quotes（最新报价快照表）
+            upsert = (
+                "INSERT INTO latest_quotes (symbol,bid,ask,spread,received_at) "
+                "VALUES (%s,%s,%s,%s,%s) "
+                "ON DUPLICATE KEY UPDATE "
+                "bid=VALUES(bid), ask=VALUES(ask), spread=VALUES(spread), received_at=VALUES(received_at)"
+            )
+            cur.executemany(upsert, rows)
         conn.close()
         _db_ok = True
     except Exception as e:
         _db_ok = False
-        print(f"[DB] insert failed ({len(batch)}): {e}")
+        print(f"[DB] insert failed (batch_size={len(batch)}): {repr(e)}")
 
 def _flush_timer():
     while True:
@@ -218,6 +270,33 @@ def _to_float(v):
     except (TypeError, ValueError):
         return None
 
+# ==================== 5字段报价模板 ====================
+def make_quote_row(raw_symbol, bid, ask, spread=None):
+    """
+    生成统一5字段报价模板 dict。
+    - 自动归一化 symbol
+    - 对 bid/ask/spread 做安全 float 转换
+    - received_at 使用东八区时间字符串
+    - 无效数据返回 None
+    """
+    norm = normalize_symbol(raw_symbol or "")
+    if not norm:
+        return None
+    bf = _to_float(bid)
+    af = _to_float(ask)
+    if bf is None or af is None:
+        return None
+    sp = _to_float(spread)
+    if sp is None:
+        sp = 0.0
+    return {
+        "symbol": norm,
+        "bid": bf,
+        "ask": af,
+        "spread": sp,
+        "received_at": now_shanghai_str(),
+    }
+
 def _bid_ask_from_dict(d):
     if not isinstance(d, dict):
         return None, None
@@ -255,7 +334,7 @@ def cache_tick_quote(raw_symbol, bid, ask, spread=None, ts=None):
         "symbol": norm,
         "spread": spread,
         "ts": ts,
-        "received_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "received_at": now_shanghai_str(),
     }
     with quote_cache_lock:
         latest_quote_cache[norm] = rec
@@ -415,7 +494,7 @@ def store_mt4_data(raw_body, client_ip, headers_dict):
     parsed_json, parse_error, parse_error_detail, remaining_data = try_parse_json(raw_body)
     category = detect_category(request.path, parsed_json if isinstance(parsed_json, dict) else None)
     record = {
-        "received_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "received_at": now_shanghai_str(),
         "ip": client_ip, "method": request.method, "path": request.path,
         "category": category, "headers": headers_dict, "body_raw": raw_body,
         "parsed": parsed_json, "parse_error": parse_error,
@@ -566,8 +645,6 @@ def _handle_tick_list(ticks):
         else:
             ts_ms = int(time.time() * 1000)
         spread = _to_float(tick.get('spread')) or 0
-        mid = (bf + af) / 2.0
-        norm = normalize_symbol(sym_raw)
 
         # 1) memory: kline + quote cache
         update_kline(sym_raw, bf, af, ts_ms)
@@ -575,7 +652,7 @@ def _handle_tick_list(ticks):
 
         # 2) history_report (frontend compat)
         record = {
-            "received_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "received_at": now_shanghai_str(),
             "ip": get_client_ip(), "method": "POST", "path": request.path,
             "category": "report", "headers": {}, "body_raw": json.dumps(tick),
             "parsed": {"desc":"QUOTE_DATA","spread":tick.get('spread',0),"ts":tt,
@@ -585,15 +662,16 @@ def _handle_tick_list(ticks):
         with history_lock:
             history_report.appendleft(record)
 
-        # 3) MySQL buffer
-        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-        _buf_append((norm, bf, af, spread, mid, ts_ms, now_str))
+        # 3) MySQL buffer（5字段模板 dict）
+        quote_row = make_quote_row(sym_raw, bid, ask, spread=spread)
+        if quote_row:
+            _buf_append(quote_row)
 
         # 4) counter
         global _tick_count, _last_tick_at
         with _tick_count_lock:
             _tick_count += 1
-            _last_tick_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            _last_tick_at = now_shanghai_str()
 
         count += 1
     return count
@@ -626,8 +704,8 @@ def tick_hist():
     try:
         ticks = request.json
         if not isinstance(ticks, list): ticks = [ticks]
-        rows = []
-        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+        old_rows = []   # tick_logs 格式（保持兼容）
+        new_rows = []   # quote_ticks / latest_quotes 格式
         for tick in ticks:
             sym_raw = tick.get('symbol')
             bid, ask = tick.get('bid'), tick.get('ask')
@@ -643,15 +721,33 @@ def tick_hist():
                 ts_ms = int(time.time() * 1000)
             mid = (bf + af) / 2.0
             norm = normalize_symbol(sym_raw)
-            rows.append((norm, bf, af, spread, mid, ts_ms, now_str))
-        if rows:
-            conn = get_conn()
-            with conn.cursor() as cur:
+            now_str = now_shanghai_str()
+            # 兼容旧 tick_logs
+            old_rows.append((norm, bf, af, spread, mid, ts_ms, now_str))
+            # 写入新 5 字段表
+            qr = make_quote_row(sym_raw, bid, ask, spread=spread)
+            if qr:
+                new_rows.append((qr["symbol"], qr["bid"], qr["ask"], qr["spread"], qr["received_at"]))
+        conn = get_conn()
+        with conn.cursor() as cur:
+            if old_rows:
                 cur.executemany(
                     "INSERT INTO tick_logs (symbol,bid,ask,spread,mid,tick_time,received_at) "
-                    "VALUES (%s,%s,%s,%s,%s,%s,%s)", rows)
-            conn.close()
-        return jsonify({"ok": True, "inserted": len(rows)}), 200
+                    "VALUES (%s,%s,%s,%s,%s,%s,%s)", old_rows)
+            # 同时补充写入新表
+            if new_rows:
+                cur.executemany(
+                    "INSERT INTO quote_ticks (symbol,bid,ask,spread,received_at) "
+                    "VALUES (%s,%s,%s,%s,%s)", new_rows)
+                upsert = (
+                    "INSERT INTO latest_quotes (symbol,bid,ask,spread,received_at) "
+                    "VALUES (%s,%s,%s,%s,%s) "
+                    "ON DUPLICATE KEY UPDATE "
+                    "bid=VALUES(bid), ask=VALUES(ask), spread=VALUES(spread), received_at=VALUES(received_at)"
+                )
+                cur.executemany(upsert, new_rows)
+        conn.close()
+        return jsonify({"ok": True, "inserted": len(old_rows)}), 200
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
@@ -726,6 +822,122 @@ def api_hist_stats():
     except Exception as e:
         return jsonify({"error":str(e)}),500
 
+# ==================== 简化报价查询（新 5 字段模板） ====================
+
+@app.route("/api/quote", methods=["GET"])
+def api_quote():
+    """查询指定 symbol 的最新报价（从 latest_quotes 表）"""
+    symbol = request.args.get("symbol", "").strip()
+    if not symbol:
+        return jsonify({"error": "symbol required"}), 400
+    norm = normalize_symbol(symbol)
+    if not norm:
+        return jsonify({"error": f"unknown symbol: {symbol}"}), 400
+    if not HAS_MYSQL:
+        return jsonify({"error": "MySQL not available"}), 503
+    try:
+        conn = get_conn()
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT symbol,bid,ask,spread,received_at FROM latest_quotes WHERE symbol=%s",
+                (norm,))
+            row = cur.fetchone()
+        conn.close()
+        if not row:
+            return jsonify({"error": f"no data for {norm}"}), 404
+        # 格式化 received_at
+        result = dict(row)
+        if isinstance(result.get("received_at"), datetime):
+            result["received_at"] = result["received_at"].strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/quotes", methods=["GET"])
+def api_quotes():
+    """返回所有产品的最新报价快照（从 latest_quotes 表）"""
+    if not HAS_MYSQL:
+        return jsonify({"error": "MySQL not available"}), 503
+    try:
+        conn = get_conn()
+        with conn.cursor() as cur:
+            cur.execute("SELECT symbol,bid,ask,spread,received_at FROM latest_quotes ORDER BY symbol")
+            rows = cur.fetchall()
+        conn.close()
+        formatted = []
+        for r in rows:
+            item = {"symbol": r["symbol"], "bid": r["bid"], "ask": r["ask"],
+                    "spread": r["spread"]}
+            if isinstance(r.get("received_at"), datetime):
+                item["received_at"] = r["received_at"].strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+            else:
+                item["received_at"] = str(r.get("received_at") or "")
+            formatted.append(item)
+        return jsonify({"count": len(formatted), "data": formatted})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/quote-hist", methods=["GET"])
+def api_quote_hist():
+    """查询 quote_ticks 历史，只返回 5 字段"""
+    if not HAS_MYSQL or not _db_ok:
+        return jsonify({"error": "MySQL not available"}), 503
+    symbol = request.args.get("symbol", "").strip()
+    if not symbol:
+        return jsonify({"error": "symbol required"}), 400
+    norm = normalize_symbol(symbol)
+    limit = min(int(request.args.get("limit", 100)), 5000)
+    from_ts = _parse_ts(request.args.get("from")) or (int(time.time()*1000) - 3600000)
+    to_ts = _parse_ts(request.args.get("to")) or (int(time.time()*1000) + 60000)
+    try:
+        conn = get_conn()
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT symbol,bid,ask,spread,received_at FROM quote_ticks "
+                "WHERE symbol=%s AND received_at>=FROM_UNIXTIME(%s/1000) "
+                "AND received_at<=FROM_UNIXTIME(%s/1000) "
+                "ORDER BY received_at ASC LIMIT %s",
+                (norm, from_ts, to_ts, limit))
+            rows = cur.fetchall()
+        conn.close()
+        formatted = []
+        for r in rows:
+            item = {"symbol": r["symbol"], "bid": r["bid"], "ask": r["ask"],
+                    "spread": r["spread"]}
+            if isinstance(r.get("received_at"), datetime):
+                item["received_at"] = r["received_at"].strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+            else:
+                item["received_at"] = str(r.get("received_at") or "")
+            formatted.append(item)
+        return jsonify({"symbol": norm, "from": from_ts, "to": to_ts,
+                         "count": len(formatted), "data": formatted})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/debug/quotes-db", methods=["GET"])
+def api_debug_quotes_db():
+    """调试接口：查看新报价表的统计信息"""
+    if not HAS_MYSQL:
+        with _buf_lock: bs = len(_write_buf)
+        return jsonify({"db_ok": False, "has_mysql": False, "buffer_pending": bs})
+    try:
+        conn = get_conn()
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) AS cnt FROM latest_quotes")
+            lq_cnt = cur.fetchone()["cnt"]
+            cur.execute("SELECT COUNT(*) AS cnt FROM quote_ticks")
+            qt_cnt = cur.fetchone()["cnt"]
+        conn.close()
+        with _buf_lock: bs = len(_write_buf)
+        return jsonify({
+            "db_ok": _db_ok,
+            "latest_quotes_count": lq_cnt,
+            "quote_ticks_count": qt_cnt,
+            "buffer_pending": bs,
+        })
+    except Exception as e:
+        return jsonify({"db_ok": False, "error": str(e)})
+
 @app.route("/api/debug/db", methods=["GET"])
 def api_debug_db():
     if not HAS_MYSQL or not _db_ok:
@@ -736,9 +948,17 @@ def api_debug_db():
         with conn.cursor() as cur:
             cur.execute("SELECT COUNT(*) AS total FROM tick_logs")
             total = cur.fetchone()["total"]
+            cur.execute("SELECT COUNT(*) AS lq_cnt FROM latest_quotes")
+            lq_cnt = cur.fetchone()["lq_cnt"]
+            cur.execute("SELECT COUNT(*) AS qt_cnt FROM quote_ticks")
+            qt_cnt = cur.fetchone()["qt_cnt"]
         conn.close()
         with _buf_lock: bs = len(_write_buf)
-        return jsonify({"db_ok":True,"total_rows":total,"buffer_pending":bs})
+        return jsonify({
+            "db_ok": True, "total_rows": total,
+            "latest_quotes_count": lq_cnt, "quote_ticks_count": qt_cnt,
+            "buffer_pending": bs,
+        })
     except Exception as e:
         return jsonify({"db_ok":False,"error":str(e)})
 
