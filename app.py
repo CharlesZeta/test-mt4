@@ -17,7 +17,6 @@ def now_shanghai_dt():
 def now_shanghai_str():
     """返回东八区时间字符串，精确到毫秒"""
     return now_shanghai_dt().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-
 from collections import deque
 from flask import Flask, request, render_template_string, jsonify
 
@@ -144,29 +143,17 @@ def _flush_buf():
 
 def _do_insert(batch):
     global _db_ok
-    if not batch:
-        return
     try:
         conn = get_conn()
         with conn.cursor() as cur:
-            # 1) 批量写入 quote_ticks（历史表）
-            rows = [(r["symbol"], r["bid"], r["ask"], r["spread"], r["received_at"]) for r in batch]
             cur.executemany(
-                "INSERT INTO quote_ticks (symbol,bid,ask,spread,received_at) "
-                "VALUES (%s,%s,%s,%s,%s)", rows)
-            # 2) Upsert 到 latest_quotes（最新报价快照表）
-            upsert = (
-                "INSERT INTO latest_quotes (symbol,bid,ask,spread,received_at) "
-                "VALUES (%s,%s,%s,%s,%s) "
-                "ON DUPLICATE KEY UPDATE "
-                "bid=VALUES(bid), ask=VALUES(ask), spread=VALUES(spread), received_at=VALUES(received_at)"
-            )
-            cur.executemany(upsert, rows)
+                "INSERT INTO tick_logs (symbol,bid,ask,spread,mid,tick_time,received_at) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s)", batch)
         conn.close()
         _db_ok = True
     except Exception as e:
         _db_ok = False
-        print(f"[DB] insert failed (batch_size={len(batch)}): {repr(e)}")
+        print(f"[DB] insert failed ({len(batch)}): {e}")
 
 def _flush_timer():
     while True:
@@ -295,6 +282,84 @@ def make_quote_row(raw_symbol, bid, ask, spread=None):
         "ask": af,
         "spread": sp,
         "received_at": now_shanghai_str(),
+    }
+
+# ==================== 时间戳工具 ====================
+def to_tick_ts_ms(ts_value):
+    """
+    将任意形式的时间值统一转换为毫秒时间戳。
+    支持：None、秒级 int/float、毫秒级 int/float、字符串数字。
+    大于 1e12 视为毫秒，否则视为秒。
+    """
+    if ts_value is None:
+        return None
+    try:
+        v = float(ts_value)
+    except (TypeError, ValueError):
+        return None
+    if v > 1e12:
+        return int(v)
+    return int(v * 1000)
+
+def ts_ms_to_shanghai_str(ts_ms):
+    """毫秒时间戳 → 东八区字符串（精确到毫秒）"""
+    if ts_ms is None:
+        return ""
+    try:
+        dt = datetime.fromtimestamp(int(ts_ms) / 1000, tz=SH_TZ)
+        return dt.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+    except (ValueError, OSError, OverflowError):
+        return ""
+
+def build_latency_fields(ts_value):
+    """
+    给定行情原始 ts，生成时差比对信息。
+    返回：quote_ts_ms, quote_time_shanghai, server_ts_ms,
+          server_time_shanghai, latency_ms, is_stale
+    """
+    quote_ts_ms = to_tick_ts_ms(ts_value)
+    now_dt = now_shanghai_dt()
+    server_ts_ms = int(now_dt.timestamp() * 1000)
+    server_time_shanghai = now_shanghai_str()
+    if quote_ts_ms is not None:
+        latency_ms = server_ts_ms - quote_ts_ms
+        is_stale = latency_ms > 3000
+    else:
+        latency_ms = None
+        is_stale = True
+    return {
+        "quote_ts_ms": quote_ts_ms,
+        "quote_time_shanghai": ts_ms_to_shanghai_str(quote_ts_ms) if quote_ts_ms else "",
+        "server_ts_ms": server_ts_ms,
+        "server_time_shanghai": server_time_shanghai,
+        "latency_ms": latency_ms,
+        "is_stale": is_stale,
+    }
+
+def build_live_quote_payload(q):
+    """
+    把 latest_quote_cache 中的一条记录 q，组装成带时差的完整行情 payload。
+    返回 None（无效）或 dict：
+      symbol, bid, ask, spread, received_at, quote_ts_ms,
+      quote_time_shanghai, server_ts_ms, server_time_shanghai,
+      latency_ms, is_stale
+    """
+    if not isinstance(q, dict):
+        return None
+    sym = q.get("symbol")
+    bid = _to_float(q.get("bid"))
+    ask = _to_float(q.get("ask"))
+    if not sym or bid is None or ask is None:
+        return None
+    ts_val = q.get("ts")
+    lat = build_latency_fields(ts_val)
+    return {
+        "symbol": sym,
+        "bid": bid,
+        "ask": ask,
+        "spread": _to_float(q.get("spread")),
+        "received_at": q.get("received_at") or "",
+        **lat,
     }
 
 def _bid_ask_from_dict(d):
@@ -645,6 +710,7 @@ def _handle_tick_list(ticks):
         else:
             ts_ms = int(time.time() * 1000)
         spread = _to_float(tick.get('spread')) or 0
+        norm = normalize_symbol(sym_raw)
 
         # 1) memory: kline + quote cache
         update_kline(sym_raw, bf, af, ts_ms)
@@ -698,7 +764,7 @@ def tick_ren():
 
 @app.route('/api/tick-hist', methods=['POST'])
 def tick_hist():
-    """Historical batch import: MySQL only, no memory update"""
+    """Historical batch import: 写旧 tick_logs + 新 quote_ticks + upsert latest_quotes"""
     if not HAS_MYSQL:
         return jsonify({"ok": False, "error": "MySQL not available"}), 503
     try:
@@ -722,9 +788,7 @@ def tick_hist():
             mid = (bf + af) / 2.0
             norm = normalize_symbol(sym_raw)
             now_str = now_shanghai_str()
-            # 兼容旧 tick_logs
             old_rows.append((norm, bf, af, spread, mid, ts_ms, now_str))
-            # 写入新 5 字段表
             qr = make_quote_row(sym_raw, bid, ask, spread=spread)
             if qr:
                 new_rows.append((qr["symbol"], qr["bid"], qr["ask"], qr["spread"], qr["received_at"]))
@@ -734,7 +798,6 @@ def tick_hist():
                 cur.executemany(
                     "INSERT INTO tick_logs (symbol,bid,ask,spread,mid,tick_time,received_at) "
                     "VALUES (%s,%s,%s,%s,%s,%s,%s)", old_rows)
-            # 同时补充写入新表
             if new_rows:
                 cur.executemany(
                     "INSERT INTO quote_ticks (symbol,bid,ask,spread,received_at) "
@@ -822,11 +885,65 @@ def api_hist_stats():
     except Exception as e:
         return jsonify({"error":str(e)}),500
 
-# ==================== 简化报价查询（新 5 字段模板） ====================
+@app.route("/api/debug/db", methods=["GET"])
+def api_debug_db():
+    if not HAS_MYSQL or not _db_ok:
+        with _buf_lock: bs = len(_write_buf)
+        return jsonify({"db_ok":False,"has_mysql":HAS_MYSQL,"buffer_pending":bs,"host":MYSQL_HOST})
+    try:
+        conn = get_conn()
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) AS total FROM tick_logs")
+            total = cur.fetchone()["total"]
+        conn.close()
+        with _buf_lock: bs = len(_write_buf)
+        return jsonify({"db_ok":True,"total_rows":total,"buffer_pending":bs})
+    except Exception as e:
+        return jsonify({"db_ok":False,"error":str(e)})
+
+# ==================== 实时内存报价接口（极速） ====================
+
+@app.route("/api/quote-live", methods=["GET"])
+def api_quote_live():
+    """从内存 latest_quote_cache 读取指定 symbol 的实时报价（含时差）"""
+    symbol = request.args.get("symbol", "").strip()
+    if not symbol:
+        return jsonify({"error": "symbol required"}), 400
+    norm = normalize_symbol(symbol)
+    if not norm:
+        return jsonify({"error": f"unknown symbol: {symbol}"}), 400
+    with quote_cache_lock:
+        q = latest_quote_cache.get(norm)
+    if not q:
+        return jsonify({"error": f"no data for {norm}"}), 404
+    payload = build_live_quote_payload(dict(q))
+    if not payload:
+        return jsonify({"error": f"invalid data for {norm}"}), 500
+    return jsonify(payload)
+
+@app.route("/api/quotes-live", methods=["GET"])
+def api_quotes_live():
+    """从内存 latest_quote_cache 读取全市场实时报价快照（含时差）"""
+    with quote_cache_lock:
+        cache_items = list(latest_quote_cache.items())
+    server_time = now_shanghai_str()
+    data = []
+    for sym, q in cache_items:
+        p = build_live_quote_payload(dict(q))
+        if p:
+            data.append(p)
+    data.sort(key=lambda x: x["symbol"])
+    return jsonify({
+        "count": len(data),
+        "server_time_shanghai": server_time,
+        "data": data,
+    })
+
+# ==================== 数据库报价接口（含时差信息） ====================
 
 @app.route("/api/quote", methods=["GET"])
 def api_quote():
-    """查询指定 symbol 的最新报价（从 latest_quotes 表）"""
+    """查询指定 symbol 的最新报价（从 latest_quotes 表），补充服务端时间"""
     symbol = request.args.get("symbol", "").strip()
     if not symbol:
         return jsonify({"error": "symbol required"}), 400
@@ -835,6 +952,8 @@ def api_quote():
         return jsonify({"error": f"unknown symbol: {symbol}"}), 400
     if not HAS_MYSQL:
         return jsonify({"error": "MySQL not available"}), 503
+    server_time = now_shanghai_str()
+    server_ts = int(now_shanghai_dt().timestamp() * 1000)
     try:
         conn = get_conn()
         with conn.cursor() as cur:
@@ -845,19 +964,29 @@ def api_quote():
         conn.close()
         if not row:
             return jsonify({"error": f"no data for {norm}"}), 404
-        # 格式化 received_at
-        result = dict(row)
-        if isinstance(result.get("received_at"), datetime):
-            result["received_at"] = result["received_at"].strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+        result = {"symbol": row["symbol"], "bid": row["bid"], "ask": row["ask"],
+                  "spread": row["spread"],
+                  "received_at": (row["received_at"].strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+                                  if hasattr(row["received_at"], "strftime") else str(row["received_at"] or "")),
+                  # 表中没有原始 ts，无法计算真正延迟，标注为 None
+                  "quote_ts_ms": None,
+                  "quote_time_shanghai": "",
+                  "server_ts_ms": server_ts,
+                  "server_time_shanghai": server_time,
+                  "latency_ms": None,
+                  "is_stale": None,
+                  }
         return jsonify(result)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 @app.route("/api/quotes", methods=["GET"])
 def api_quotes():
-    """返回所有产品的最新报价快照（从 latest_quotes 表）"""
+    """返回所有产品的最新报价快照（从 latest_quotes 表），补充服务端时间"""
     if not HAS_MYSQL:
         return jsonify({"error": "MySQL not available"}), 503
+    server_time = now_shanghai_str()
+    server_ts = int(now_shanghai_dt().timestamp() * 1000)
     try:
         conn = get_conn()
         with conn.cursor() as cur:
@@ -867,19 +996,24 @@ def api_quotes():
         formatted = []
         for r in rows:
             item = {"symbol": r["symbol"], "bid": r["bid"], "ask": r["ask"],
-                    "spread": r["spread"]}
-            if isinstance(r.get("received_at"), datetime):
-                item["received_at"] = r["received_at"].strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-            else:
-                item["received_at"] = str(r.get("received_at") or "")
+                    "spread": r["spread"],
+                    "received_at": (r["received_at"].strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+                                    if hasattr(r["received_at"], "strftime") else str(r.get("received_at") or "")),
+                    "quote_ts_ms": None,
+                    "quote_time_shanghai": "",
+                    "server_ts_ms": server_ts,
+                    "server_time_shanghai": server_time,
+                    "latency_ms": None,
+                    "is_stale": None,
+                    }
             formatted.append(item)
-        return jsonify({"count": len(formatted), "data": formatted})
+        return jsonify({"count": len(formatted), "server_time_shanghai": server_time, "data": formatted})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 @app.route("/api/quote-hist", methods=["GET"])
 def api_quote_hist():
-    """查询 quote_ticks 历史，只返回 5 字段"""
+    """查询 quote_ticks 历史，只返回 5 字段（不含时差，表内无 ts）"""
     if not HAS_MYSQL or not _db_ok:
         return jsonify({"error": "MySQL not available"}), 503
     symbol = request.args.get("symbol", "").strip()
@@ -902,9 +1036,8 @@ def api_quote_hist():
         conn.close()
         formatted = []
         for r in rows:
-            item = {"symbol": r["symbol"], "bid": r["bid"], "ask": r["ask"],
-                    "spread": r["spread"]}
-            if isinstance(r.get("received_at"), datetime):
+            item = {"symbol": r["symbol"], "bid": r["bid"], "ask": r["ask"], "spread": r["spread"]}
+            if hasattr(r.get("received_at"), "strftime"):
                 item["received_at"] = r["received_at"].strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
             else:
                 item["received_at"] = str(r.get("received_at") or "")
@@ -916,10 +1049,14 @@ def api_quote_hist():
 
 @app.route("/api/debug/quotes-db", methods=["GET"])
 def api_debug_quotes_db():
-    """调试接口：查看新报价表的统计信息"""
+    """调试接口：查看新报价表的统计信息，含服务端时间"""
+    now_s = now_shanghai_str()
+    now_ms = int(now_shanghai_dt().timestamp() * 1000)
     if not HAS_MYSQL:
         with _buf_lock: bs = len(_write_buf)
-        return jsonify({"db_ok": False, "has_mysql": False, "buffer_pending": bs})
+        return jsonify({"db_ok": False, "has_mysql": False,
+                        "buffer_pending": bs,
+                        "server_time_shanghai": now_s, "server_ts_ms": now_ms})
     try:
         conn = get_conn()
         with conn.cursor() as cur:
@@ -934,40 +1071,86 @@ def api_debug_quotes_db():
             "latest_quotes_count": lq_cnt,
             "quote_ticks_count": qt_cnt,
             "buffer_pending": bs,
+            "server_time_shanghai": now_s,
+            "server_ts_ms": now_ms,
         })
     except Exception as e:
-        return jsonify({"db_ok": False, "error": str(e)})
+        return jsonify({"db_ok": False, "error": str(e),
+                        "server_time_shanghai": now_s, "server_ts_ms": now_ms})
 
-@app.route("/api/debug/db", methods=["GET"])
-def api_debug_db():
-    if not HAS_MYSQL or not _db_ok:
-        with _buf_lock: bs = len(_write_buf)
-        return jsonify({"db_ok":False,"has_mysql":HAS_MYSQL,"buffer_pending":bs,"host":MYSQL_HOST})
-    try:
-        conn = get_conn()
-        with conn.cursor() as cur:
-            cur.execute("SELECT COUNT(*) AS total FROM tick_logs")
-            total = cur.fetchone()["total"]
-            cur.execute("SELECT COUNT(*) AS lq_cnt FROM latest_quotes")
-            lq_cnt = cur.fetchone()["lq_cnt"]
-            cur.execute("SELECT COUNT(*) AS qt_cnt FROM quote_ticks")
-            qt_cnt = cur.fetchone()["qt_cnt"]
-        conn.close()
-        with _buf_lock: bs = len(_write_buf)
-        return jsonify({
-            "db_ok": True, "total_rows": total,
-            "latest_quotes_count": lq_cnt, "quote_ticks_count": qt_cnt,
-            "buffer_pending": bs,
-        })
-    except Exception as e:
-        return jsonify({"db_ok":False,"error":str(e)})
+# ==================== SSE 持续监听接口 ====================
+
+@app.route("/api/stream/quote", methods=["GET"])
+def stream_quote():
+    """SSE 持续推送指定 symbol 的实时报价（内存）"""
+    from flask import Response
+    symbol = request.args.get("symbol", "").strip()
+    if not symbol:
+        return jsonify({"error": "symbol required"}), 400
+    norm = normalize_symbol(symbol)
+    if not norm:
+        return jsonify({"error": f"unknown symbol: {norm}"}), 400
+
+    last_payload_str = ""
+
+    def generate():
+        nonlocal last_payload_str
+        while True:
+            with quote_cache_lock:
+                q = latest_quote_cache.get(norm)
+            if q:
+                payload = build_live_quote_payload(dict(q))
+                if payload:
+                    s = json.dumps(payload, ensure_ascii=False)
+                    if s != last_payload_str:
+                        last_payload_str = s
+                        yield f"data: {s}\n\n"
+            time.sleep(0.2)
+
+    return Response(generate(), mimetype="text/event-stream",
+                   headers={"X-Accel-Buffering": "no"})
+
+@app.route("/api/stream/quotes", methods=["GET"])
+def stream_quotes():
+    """SSE 持续推送全市场实时报价快照（内存）"""
+    from flask import Response
+    last_payload_str = ""
+
+    def generate():
+        nonlocal last_payload_str
+        while True:
+            with quote_cache_lock:
+                items = list(latest_quote_cache.items())
+            server_time = now_shanghai_str()
+            data = []
+            for sym, q in items:
+                p = build_live_quote_payload(dict(q))
+                if p:
+                    data.append(p)
+            data.sort(key=lambda x: x["symbol"])
+            payload = {"count": len(data), "server_time_shanghai": server_time, "data": data}
+            s = json.dumps(payload, ensure_ascii=False)
+            if s != last_payload_str:
+                last_payload_str = s
+                yield f"data: {s}\n\n"
+            time.sleep(0.5)
+
+    return Response(generate(), mimetype="text/event-stream",
+                   headers={"X-Accel-Buffering": "no"})
 
 @app.route("/api/health", methods=["GET"])
 def api_health():
     with _tick_count_lock: cnt=_tick_count; last=_last_tick_at
     with quote_cache_lock: syms=list(latest_quote_cache.keys())
+    with _buf_lock: bs=len(_write_buf)
+    now_s = now_shanghai_str()
+    now_ms = int(now_shanghai_dt().timestamp() * 1000)
+    # 距上次 flush 的毫秒数
+    flush_age_ms = int((time.time() - _last_flush) * 1000)
     return jsonify({"status":"ok","ticks_received":cnt,"last_tick_at":last,
-        "symbols_cached":len(syms),"symbols":syms[:20],"db_ok":_db_ok,"has_mysql":HAS_MYSQL})
+        "symbols_cached":len(syms),"symbols":syms[:20],"db_ok":_db_ok,"has_mysql":HAS_MYSQL,
+        "server_time_shanghai":now_s,"server_ts_ms":now_ms,
+        "buffer_pending":bs,"latest_flush_age_ms":flush_age_ms})
 
 # ==================== K线 & 产品接口 ====================
 @app.route("/api/kline", methods=["GET"])
@@ -1133,6 +1316,7 @@ align-items:center;border-radius:.5rem;cursor:pointer;transition:.1s;color:var(-
 </div>
 
 <script>
+// ==================== 全局状态 ====================
 const $=id=>document.getElementById(id);
 const CP={
 forex:["EURUSD","GBPUSD","USDJPY","USDCHF","AUDUSD","USDCAD","NZDUSD","EURGBP","EURJPY","GBPJPY","AUDJPY","EURAUD","EURCHF","GBPCHF","CHFJPY","CADJPY","AUDNZD","AUDCAD","AUDCHF","EURNZD","EURCAD","CADCHF","NZDJPY","GBPAUD","GBPCAD","GBPNZD","NZDCAD","NZDCHF","USDSGD","USDHKD","USDCNH"],
@@ -1142,8 +1326,18 @@ crypto:["BTCUSD","ETHUSD","LTCUSD","BCHUSD","XMRUSD","BNBUSD","SOLUSD","ADAUSD",
 stock:["AAPL","AMZN","BABA","GOOGL","META","MSFT","NFLX","NVDA","TSLA","ABBV","ABNB","ABT","ADBE","AMD","AVGO","C","CRM","DIS","GS","INTC","JNJ","MA","MCD","KO","MMM","NIO","PLTR","SHOP","TSM","V"]
 };
 const CN={forex:"外汇",metal:"贵金属",commodity:"大宗商品",index:"指数",crypto:"虚拟货币",stock:"股票"};
-let S="EURUSD",C="forex",TF="5min",lastM=null,stag=0,sigP=0,cBars=[],L=null;
+let S="EURUSD",C="forex",TF="5min",lastM=null,stag=0,sigP=0;
+let cBars=[];   // 全量 K 线数据
 
+// ==================== K线视口状态 ====================
+let vStart=0;          // 当前视图起始索引（可以是小数）
+let vBars=60;          // 当前视图可见 Bar 数量
+const V_MIN=10, V_MAX=200;  // 缩放范围
+
+// 十字光标状态
+let crosshair={active:false,x:0,y:0,barIdx:-1};
+
+// ==================== 工具函数 ====================
 function dg(s){if(!s)return 2;const u=s.toUpperCase();
 if(u==="XAUUSD"||u==="XAGUSD"||u==="UKOUSD"||u==="USOUSD")return 2;
 if(u==="BTCUSD"||u==="ETHUSD")return 2;
@@ -1151,12 +1345,12 @@ if(u.endsWith("JPY"))return 3;
 if(["DOGUSD","ADAUSD","RPLUSD","XSIUSD","LNKUSD"].includes(u))return 5;
 if(["LTCUSD","SOLUSD","BCHUSD","XMRUSD","BNBUSD","AVEUSD","DSHUSD"].includes(u))return 2;
 if(["U30USD","NASUSD","SPXUSD","100GBP","D30EUR","E50EUR","H33HKD"].includes(u))return 1;
-// 股票: 没有典型外汇后缀
 const fx=["USD","GBP","EUR","JPY","CHF","AUD","NZD","CAD","HKD","SGD","CNH"];
 if(!fx.some(c=>u.includes(c)))return 2;
 return 5;}
 function fm(n,d){return n!=null?parseFloat(n).toFixed(d):'--'}
 
+// Y轴区间自适应算法（智能 padding + 网格分度）
 function nS(lo,hi,mt){
 if(lo===hi){const d=lo===0?1:Math.abs(lo)*.01;lo-=d;hi+=d}
 const r=hi-lo,p=r*.08;let mn=lo-p,mx=hi+p;
@@ -1165,16 +1359,321 @@ let ns;if(res<=1)ns=mg;else if(res<=2)ns=2*mg;else if(res<=2.5)ns=2.5*mg;
 else if(res<=5)ns=5*mg;else ns=10*mg;
 const tI=Math.floor(mn/ns)*ns,tA=Math.ceil(mx/ns)*ns,tk=[];
 for(let v=tI;v<=tA+ns*.5;v+=ns)tk.push(v);
-return{tI,tA,ns,tk}}
+return{tI:tI,tA:tA,ns:ns,tk:tk}}
 
+// ==================== 绘制引擎 ====================
+function drawK(){
+const cv=$('kc');if(!cv)return;
+const ctx=cv.getContext('2d');
+const dpr=devicePixelRatio||1,w=cv.offsetWidth,h=cv.offsetHeight;
+if(w<=0||h<=0)return;
+cv.width=w*dpr;cv.height=h*dpr;ctx.scale(dpr,dpr);
+ctx.clearRect(0,0,w,h);
+
+if(!cBars||cBars.length===0){drawE();return}
+
+const PL=8,PR=76,PT=16,PB=32,cW=w-PL-PR,cH=h-PT-PB;
+if(cW<=0||cH<=0)return;
+
+// 计算当前视图
+const totalBars=cBars.length;
+const endIdx=Math.min(vStart+vBars,totalBars);
+const startIdxF=vStart;
+const endIdxF=Math.min(endIdx,totalBars);
+const visibleCount=endIdxF-startIdxF;
+if(visibleCount<=0){drawE();return}
+
+// 提取可见 bars
+const vb=cBars.slice(Math.floor(startIdxF),Math.ceil(endIdxF));
+const n=vb.length;
+
+// ---- Y轴自动缩放（基于可见范围）----
+let dMin=Infinity,dMax=-Infinity;
+for(const b of vb){
+  if(b[2]>dMax)dMax=b[2];
+  if(b[3]<dMin)dMin=b[3];
+}
+const D=dg(S),sc=nS(dMin,dMax,6);
+const yI=sc.tI,yA=sc.tA,yR=yA-yI||1;
+const p2y=p=>PT+cH*(1-(p-yI)/yR),y2p=y=>yI+(1-(y-PT)/cH)*yR;
+
+// ---- X轴：每个 bar 宽度动态计算 ----
+const bT=cW/visibleCount;    // 小数精度
+const gap=Math.max(1,Math.round(bT*.2));
+const bW=Math.max(1,Math.floor(bT-gap));
+const hB=bW/2;
+// bar 索引 → 画布 x 坐标（支持小数索引）
+const bxAt=(idx)=>PL+(idx-startIdxF+0.5)*bT;
+
+L={PL,PR,PT,PB,cW,cH,bT,vBars,startIdxF,endIdxF,yI,yA,yR,p2y,y2p,D,vb,totalBars};
+
+// 颜色
+const G='#0ecb81',R='#f6465d',gr='rgba(255,255,255,0.04)',ax='#5e6673';
+
+// ---- 绘制网格 & Y轴标签 ----
+ctx.font='11px "SF Mono",Menlo,monospace';
+ctx.textAlign='left';
+ctx.textBaseline='middle';
+for(const t of sc.tk){
+  const y=p2y(t);
+  if(y<PT-2||y>PT+cH+2)continue;
+  ctx.strokeStyle=gr;ctx.lineWidth=1;
+  ctx.beginPath();ctx.moveTo(PL,Math.round(y)+.5);ctx.lineTo(PL+cW,Math.round(y)+.5);ctx.stroke();
+  ctx.fillStyle=ax;ctx.fillText(t.toFixed(D),PL+cW+6,y)
+}
+
+// ---- 绘制烛台 ----
+for(let i=0;i<n;i++){
+  const b=vb[i];
+  // 计算这个 bar 在画布上的精确 x
+  const barIdx=Math.floor(startIdxF)+i;
+  const x=bxAt(barIdx);
+  const o=b[1],hi=b[2],lo=b[3],cl=b[4];
+  const up=cl>=o,col=up?G:R;
+  // 上影线
+  ctx.strokeStyle=col;ctx.lineWidth=1;
+  ctx.beginPath();ctx.moveTo(Math.round(x)+.5,Math.round(p2y(hi)));ctx.lineTo(Math.round(x)+.5,Math.round(p2y(lo)));ctx.stroke();
+  // 实体
+  const yO=p2y(o),yC=p2y(cl),bt=Math.min(yO,yC),bh=Math.abs(yC-yO);
+  ctx.fillStyle=col;
+  ctx.fillRect(Math.round(x-hB),Math.round(bt),Math.max(1,bW),Math.max(1,bh));
+}
+
+// ---- 最新价虚线（跟随视图最右侧）----
+const lastBarIdx=Math.min(Math.floor(endIdxF)-1,totalBars-1);
+if(lastBarIdx>=0){
+  const lastBar=cBars[lastBarIdx];
+  const lc=lastBar[4],up=lc>=lastBar[1],col=up?G:R,yL=p2y(lc);
+  ctx.setLineDash([4,3]);ctx.strokeStyle=col;ctx.lineWidth=1;
+  ctx.beginPath();ctx.moveTo(PL,Math.round(yL)+.5);ctx.lineTo(PL+cW,Math.round(yL)+.5);ctx.stroke();ctx.setLineDash([]);
+  // 价格标签
+  const tW=PR-6,tH=18,tX=PL+cW+2,tY=Math.round(yL)-tH/2;
+  ctx.fillStyle=col;ctx.beginPath();ctx.roundRect(tX,tY,tW,tH,3);ctx.fill();
+  ctx.fillStyle='#fff';ctx.font='bold 11px "SF Mono",Menlo,monospace';ctx.textAlign='center';ctx.textBaseline='middle';
+  ctx.fillText(lc.toFixed(D),tX+tW/2,Math.round(yL));
+}
+
+// ---- X轴标签 ----
+ctx.fillStyle=ax;ctx.font='10px "SF Mono",Menlo,monospace';ctx.textAlign='center';ctx.textBaseline='top';
+const mG=60,iMs=TF==='1hour'?3600000*4:TF==='10min'?3600000:1800000;
+let lX=-Infinity;
+// 每隔一定像素间距画一个时间标签
+for(let i=0;i<visibleCount;i++){
+  const barIdx=Math.floor(startIdxF)+i;
+  if(barIdx<0||barIdx>=totalBars)continue;
+  const ts=cBars[barIdx][0],x=bxAt(barIdx);
+  if(barIdx!==0&&barIdx!==totalBars-1&&ts%iMs!==0)continue;
+  if(x-lX<mG&&barIdx!==0&&barIdx!==totalBars-1)continue;
+  const d=new Date(ts+8*3600000);
+  let lb;
+  if(TF==='1hour')lb=(d.getUTCMonth()+1)+'/'+d.getUTCDate()+' '+String(d.getUTCHours()).padStart(2,'0')+':00';
+  else lb=String(d.getUTCHours()).padStart(2,'0')+':'+String(d.getUTCMinutes()).padStart(2,'0');
+  ctx.strokeStyle=gr;ctx.lineWidth=1;
+  ctx.beginPath();ctx.moveTo(Math.round(x)+.5,PT+cH);ctx.lineTo(Math.round(x)+.5,PT+cH+4);ctx.stroke();
+  ctx.fillStyle=ax;ctx.fillText(lb,x,PT+cH+6);lX=x;
+}
+
+// ---- 拖拽时显示位置指示 ----
+if(isDragging){
+  const pct=(vStart/(totalBars-vBars))*100;
+  const barPct=vBars/totalBars*100;
+  drawScrollBar(pct,barPct);
+}
+
+// ---- 十字光标（覆盖层）----
+drawCrosshair();
+}
+
+function drawScrollBar(posPct,barPct){
+const cv=$('kc');if(!cv)return;
+const ctx=cv.getContext('2d');
+const dpr=devicePixelRatio||1,w=cv.offsetWidth,h=cv.offsetHeight;
+const H=4,y=h-H-4;
+const barW=w*barPct/100;
+const thumbX=w*posPct/100;
+ctx.fillStyle='rgba(255,255,255,0.15)';
+ctx.fillRect(0,y,w,H);
+ctx.fillStyle='rgba(255,255,255,0.5)';
+ctx.fillRect(Math.round(thumbX),y,Math.max(4,Math.round(barW)),H);
+}
+
+function drawE(){
+const cv=$('kc');if(!cv)return;
+const ctx=cv.getContext('2d'),dpr=devicePixelRatio||1,w=cv.offsetWidth,h=cv.offsetHeight;
+cv.width=w*dpr;cv.height=h*dpr;ctx.scale(dpr,dpr);ctx.clearRect(0,0,w,h);
+ctx.fillStyle='#5e6673';ctx.font='13px sans-serif';ctx.textAlign='center';ctx.textBaseline='middle';
+ctx.fillText('暂无 K 线数据',w/2,h/2);L=null;crosshair={active:false,x:0,y:0,barIdx:-1};
+}
+
+// ==================== 十字光标 ====================
+function drawCrosshair(){
+const cv=$('cc');if(!cv)return;
+const dpr=devicePixelRatio||1,w=cv.offsetWidth,h=cv.offsetHeight;
+cv.width=w*dpr;cv.height=h*dpr;cv.getContext('2d').scale(dpr,dpr);
+if(!crosshair.active||!L){cv.getContext('2d').clearRect(0,0,w,h);return}
+const ctx=cv.getContext('2d');
+ctx.clearRect(0,0,w,h);
+const{PL,PT,cW,cH,bT,startIdxF,D,vb,totalBars}=L;
+const cx=Math.max(PL,Math.min(crosshair.x,PL+cW)),cy=Math.max(PT,Math.min(crosshair.y,PT+cH));
+const fracIdx=startIdxF+(cx-PL)/bT;
+const idx=Math.max(0,Math.min(Math.floor(fracIdx),totalBars-1));
+ctx.setLineDash([3,3]);ctx.strokeStyle='rgba(255,255,255,0.25)';ctx.lineWidth=1;
+ctx.beginPath();ctx.moveTo(Math.round(cx)+.5,PT);ctx.lineTo(Math.round(cx)+.5,PT+cH);ctx.stroke();
+ctx.beginPath();ctx.moveTo(PL,Math.round(cy)+.5);ctx.lineTo(PL+cW,Math.round(cy)+.5);ctx.stroke();
+ctx.setLineDash([]);
+const pr=L.y2p(cy);ctx.fillStyle='#2b3139';
+const tW2=64,tH2=18,tX2=PL+cW+2,tY2=Math.round(cy)-tH2/2;
+ctx.beginPath();ctx.roundRect(tX2,tY2,tW2,tH2,3);ctx.fill();
+ctx.fillStyle='#eaecef';ctx.font='11px "SF Mono",Menlo,monospace';ctx.textAlign='center';ctx.textBaseline='middle';
+ctx.fillText(pr.toFixed(D),tX2+tW2/2,Math.round(cy));
+if(idx>=0&&idx<totalBars){
+  const b=cBars[idx],ts=b[0],d=new Date(ts+8*3600000);
+  let lb;if(TF==='1hour')lb=(d.getUTCMonth()+1)+'/'+d.getUTCDate()+' '+String(d.getUTCHours()).padStart(2,'0')+':00';
+  else lb=String(d.getUTCHours()).padStart(2,'0')+':'+String(d.getUTCMinutes()).padStart(2,'0');
+  const x=bxAtGlobal(idx);
+  const tw=ctx.measureText(lb).width+12,tx=Math.round(x)-tw/2,ty=PT+cH+2;
+  ctx.fillStyle='#2b3139';ctx.beginPath();ctx.roundRect(tx,ty,tw,16,3);ctx.fill();
+  ctx.fillStyle='#eaecef';ctx.font='10px "SF Mono",Menlo,monospace';ctx.textAlign='center';ctx.textBaseline='top';
+  ctx.fillText(lb,Math.round(x),ty+2);
+  const o=b[1],hi=b[2],lo=b[3],cl=b[4],up=cl>=o,c2=up?'#0ecb81':'#f6465d';
+  $('oI').innerHTML=`<span style="color:${c2}">O:${o.toFixed(D)} H:${hi.toFixed(D)} L:${lo.toFixed(D)} C:${cl.toFixed(D)}</span>`
+}else{
+  $('oI').innerText='';
+}}
+
+function bxAtGlobal(idx){
+if(!L)return 0;
+return L.PL+(idx-L.startIdxF+0.5)*L.bT;
+}
+
+// ==================== 拖拽平移 ====================
+let isDragging=false,lastDragX=0;
+
+function onDragStart(x){
+isDragging=true;lastDragX=x;crosshair.active=false;drawK();
+}
+function onDragMove(x){
+if(!isDragging)return;
+const dx=lastDragX-x;
+if(!L||!L.bT||cBars.length===0)return;
+const totalBars=cBars.length;
+const scrollable=totalBars-vBars;
+if(scrollable<=0)return;
+const idxDelta=dx/L.bT;
+vStart=Math.max(0,Math.min(vStart+idxDelta,scrollable));
+lastDragX=x;drawK();
+}
+function onDragEnd(){
+isDragging=false;drawK();
+}
+
+// ==================== 缩放 ====================
+function onWheel(e){
+e.preventDefault();
+if(!L||cBars.length===0)return;
+const delta=e.deltaY<0?1:-1;
+const factor=delta>0?0.85:1.18;
+const newVBars=Math.max(V_MIN,Math.min(V_MAX,Math.round(vBars*factor)));
+if(newVBars===vBars)return;
+// 以鼠标位置为中心缩放
+const mouseX=e.offsetX;
+const frac=(mouseX-L.PL)/L.cW;
+const mouseIdx=vStart+frac*vBars;
+vBars=newVBars;
+const scrollable=cBars.length-vBars;
+if(scrollable>0){
+  vStart=Math.max(0,Math.min(mouseIdx-frac*vBars,scrollable));
+}else{
+  vStart=0;
+}
+drawK();
+}
+
+let lastPinchDist=0;
+function onPinchStart(touches){
+lastPinchDist=Math.hypot(touches[0].clientX-touches[1].clientX,touches[0].clientY-touches[1].clientY);
+}
+function onPinchMove(touches){
+const dist=Math.hypot(touches[0].clientX-touches[1].clientX,touches[0].clientY-touches[1].clientY);
+if(!lastPinchDist)return;
+const factor=dist/lastPinchDist;
+const newVBars=Math.max(V_MIN,Math.min(V_MAX,Math.round(vBars/factor)));
+if(newVBars!==vBars){
+  const midX=(touches[0].clientX+touches[1].clientX)/2;
+  const wrap=$('cW');if(!wrap)return;
+  const rect=wrap.getBoundingClientRect();
+  const relX=midX-rect.left;
+  const frac=relX/L.cW;
+  vBars=newVBars;
+  const scrollable=cBars.length-vBars;
+  vStart=scrollable>0?Math.max(0,Math.min(midIdx-frac*vBars,scrollable)):0;
+  lastPinchDist=dist;
+  drawK();
+}else{
+  lastPinchDist=dist;
+}}
+
+// ==================== 交互绑定 ====================
+(function(){
+const wr=$('cW');if(!wr)return;
+const cc=$('cc');if(cc){
+  cc.style.pointerEvents='none';
+}
+function pos(e){const r=wr.getBoundingClientRect();
+  return e.touches?{x:e.touches[0].clientX-r.left,y:e.touches[0].clientY-r.top}:{x:e.clientX-r.left,y:e.clientY-r.top}}
+
+// 鼠标
+wr.addEventListener('mousedown',e=>{if(e.button===0){onDragStart(e.offsetX)}});
+wr.addEventListener('mousemove',e=>{
+  if(isDragging){onDragMove(e.offsetX)}
+  else{
+    crosshair.active=true;crosshair.x=e.offsetX;crosshair.y=e.offsetY;
+    drawCrosshair();
+  }
+});
+wr.addEventListener('mouseleave',()=>{
+  if(isDragging){isDragging=false;drawK()}
+  crosshair.active=false;drawCrosshair();
+});
+wr.addEventListener('mouseup',()=>{if(isDragging)onDragEnd()});
+wr.addEventListener('wheel',onWheel,{passive:false});
+
+// 触摸
+wr.addEventListener('touchstart',e=>{
+  if(e.touches.length===1){onDragStart(e.touches[0].clientX-wr.getBoundingClientRect().left)}
+  else if(e.touches.length===2){onPinchStart(e.touches)}
+  e.preventDefault();
+},{passive:false});
+wr.addEventListener('touchmove',e=>{
+  if(e.touches.length===1&&isDragging){onDragMove(e.touches[0].clientX-wr.getBoundingClientRect().left)}
+  else if(e.touches.length===2){onPinchMove(e.touches)}
+  e.preventDefault();
+},{passive:false});
+wr.addEventListener('touchend',e=>{
+  if(isDragging)onDragEnd();
+  lastPinchDist=0;
+  e.preventDefault();
+},{passive:false});
+})();
+
+// ==================== 业务逻辑 ====================
 function tick(){const n=new Date();$('clk').innerText=[n.getHours(),n.getMinutes(),n.getSeconds()].map(v=>String(v).padStart(2,'0')).join(':')}
 function stab(b,c){document.querySelectorAll('.tab').forEach(t=>t.classList.remove('on'));b.classList.add('on');C=c}
 function openM(){$('mTi').innerText='切换'+(CN[C]||'品种');
 $('mLi').innerHTML=(CP[C]||[]).map(s=>`<div class="it ${s===S?'on':''}" onclick="pick('${s}')"><span>${s}</span></div>`).join('');
 $('msk').style.display='flex'}
-function pick(s){S=s;$('sN').innerText=s;$('msk').style.display='none';
-['bP','aP','mP','mP2','sV','bB','bA'].forEach(id=>{if($(id))$(id).innerText='--'});
-$('sT').innerText='点差: --';lastM=null;stag=0;drawE();rf();fK()}
+function pick(s){
+  S=s;C=detectCategoryBySymbol(s);
+  $('sN').innerText=s;$('msk').style.display='none';
+  ['bP','aP','mP','mP2','sV','bB','bA'].forEach(id=>{if($(id))$(id).innerText='--'});
+  $('sT').innerText='点差: --';lastM=null;stag=0;
+  drawE();rf();fK()
+// 重置视图
+  vStart=0;vBars=60;
+}
+function detectCategoryBySymbol(sym){
+for(const[c,arr]of Object.entries(CP)){if(arr.includes(sym))return c}
+return'forex'}
 
 async function rf(){try{
 const r=await fetch('/api/latest_status?symbol='+encodeURIComponent(S)),d=await r.json();
@@ -1198,104 +1697,22 @@ $('uT').innerText='数据: '+dt.toLocaleString('zh-CN',{hour12:false,timeZone:'A
 else if(q.received_at)$('uT').innerText='更新: '+(q.received_at.split(' ')[1]||'--')
 }}catch(e){console.error(e);cOk(false)}}
 
-async function fK(){try{
-const lm={_5min:300,_10min:250,_1hour:200};
-const r=await fetch('/api/kline?symbol='+encodeURIComponent(S)+'&tf='+encodeURIComponent(TF)+'&limit='+(lm['_'+TF]||300)),d=await r.json();
-if(d.bars&&d.bars.length>0){cBars=d.bars;drawK(d.bars)}else{cBars=[];drawE()}
-}catch(e){drawE()}}
-function stf(b){document.querySelectorAll('.tf').forEach(t=>t.classList.remove('on'));b.classList.add('on');TF=b.dataset.tf;fK()}
+async function fK(){
+try{
+const maxLimit=TF==='5min'?300:TF==='10min'?250:200;
+const r=await fetch('/api/kline?symbol='+encodeURIComponent(S)+'&tf='+encodeURIComponent(TF)+'&limit='+maxLimit),d=await r.json();
+if(d.bars&&d.bars.length>0){
+  cBars=d.bars;
+  // 保持当前视图位置（如果新数据比当前视图更靠后，则跟随）
+  const scrollable=Math.max(0,cBars.length-vBars);
+  vStart=Math.min(vStart,scrollable);
+  drawK();
+}else{cBars=[];drawE()}
+}catch(e){cBars=[];drawE()}
+}
 
-// ========== K线绘制 ==========
-function drawK(bars){
-const cv=$('kc');if(!cv)return;const ctx=cv.getContext('2d');
-const dpr=devicePixelRatio||1,w=cv.offsetWidth,h=cv.offsetHeight;
-if(w<=0||h<=0)return;cv.width=w*dpr;cv.height=h*dpr;ctx.scale(dpr,dpr);ctx.clearRect(0,0,w,h);
-if(!bars||!bars.length){drawE();return}
-const PL=8,PR=72,PT=16,PB=24,cW=w-PL-PR,cH=h-PT-PB;
-if(cW<=0||cH<=0)return;
-const df={_5min:80,_10min:60,_1hour:48};
-let vn=Math.min(df['_'+TF]||80,bars.length,Math.floor(cW/6));
-vn=Math.max(vn,Math.min(20,bars.length));
-const vb=bars.slice(-vn),n=vb.length;if(!n)return;
-let dMin=Infinity,dMax=-Infinity;
-for(const b of vb){if(b[2]>dMax)dMax=b[2];if(b[3]<dMin)dMin=b[3]}
-const D=dg(S),sc=nS(dMin,dMax,6),yI=sc.tI,yA=sc.tA,yR=yA-yI||1;
-const p2y=p=>PT+cH*(1-(p-yI)/yR),y2p=y=>yI+(1-(y-PT)/cH)*yR;
-const bT=cW/n,gap=Math.max(1,Math.round(bT*.2)),bW=Math.max(1,Math.floor(bT-gap)),hB=bW/2;
-const bx=i=>PL+(i+.5)*bT;
-L={PL,PR,PT,PB,cW,cH,n,bT,yI,yA,yR,p2y,y2p,bx,D,vb};
-const G='#0ecb81',R='#f6465d',gr='rgba(255,255,255,0.04)',ax='#5e6673';
-// Y轴
-ctx.font='11px "SF Mono",Menlo,monospace';ctx.textAlign='left';ctx.textBaseline='middle';
-for(const t of sc.tk){const y=p2y(t);if(y<PT-2||y>PT+cH+2)continue;
-ctx.strokeStyle=gr;ctx.lineWidth=1;ctx.beginPath();ctx.moveTo(PL,Math.round(y)+.5);ctx.lineTo(PL+cW,Math.round(y)+.5);ctx.stroke();
-ctx.fillStyle=ax;ctx.fillText(t.toFixed(D),PL+cW+8,y)}
-// 烛台
-for(let i=0;i<n;i++){const b=vb[i],o=b[1],hi=b[2],lo=b[3],cl=b[4];
-const up=cl>=o,col=up?G:R,x=bx(i);
-ctx.strokeStyle=col;ctx.lineWidth=1;ctx.beginPath();
-ctx.moveTo(Math.round(x)+.5,Math.round(p2y(hi)));ctx.lineTo(Math.round(x)+.5,Math.round(p2y(lo)));ctx.stroke();
-const yO=p2y(o),yC=p2y(cl),bt=Math.min(yO,yC),bb=Math.max(yO,yC);
-ctx.fillStyle=col;ctx.fillRect(Math.round(x-hB),Math.round(bt),bW,Math.max(1,bb-bt))}
-// 最新价虚线
-if(n>0){const lc=vb[n-1][4],up=lc>=vb[n-1][1],col=up?G:R,yL=p2y(lc);
-ctx.setLineDash([4,3]);ctx.strokeStyle=col;ctx.lineWidth=1;
-ctx.beginPath();ctx.moveTo(PL,Math.round(yL)+.5);ctx.lineTo(PL+cW,Math.round(yL)+.5);ctx.stroke();ctx.setLineDash([]);
-const tW=PR-6,tH=18,tX=PL+cW+2,tY=Math.round(yL)-tH/2;
-ctx.fillStyle=col;ctx.beginPath();ctx.roundRect(tX,tY,tW,tH,3);ctx.fill();
-ctx.fillStyle='#fff';ctx.font='bold 11px "SF Mono",Menlo,monospace';ctx.textAlign='center';ctx.textBaseline='middle';
-ctx.fillText(lc.toFixed(D),tX+tW/2,Math.round(yL))}
-// X轴
-ctx.fillStyle=ax;ctx.font='10px "SF Mono",Menlo,monospace';ctx.textAlign='center';ctx.textBaseline='top';
-const mG=60,iMs=TF==='1hour'?3600000*4:TF==='10min'?3600000:1800000;let lX=-Infinity;
-for(let i=0;i<n;i++){const ts=vb[i][0],x=bx(i);
-if(ts%iMs!==0&&i!==0&&i!==n-1)continue;if(x-lX<mG)continue;
-const d=new Date(ts+8*3600000);let lb;
-if(TF==='1hour')lb=(d.getUTCMonth()+1)+'/'+d.getUTCDate()+' '+String(d.getUTCHours()).padStart(2,'0')+':00';
-else lb=String(d.getUTCHours()).padStart(2,'0')+':'+String(d.getUTCMinutes()).padStart(2,'0');
-ctx.strokeStyle=gr;ctx.lineWidth=1;ctx.beginPath();ctx.moveTo(Math.round(x)+.5,PT+cH);ctx.lineTo(Math.round(x)+.5,PT+cH+4);ctx.stroke();
-ctx.fillStyle=ax;ctx.fillText(lb,x,PT+cH+6);lX=x}
-clrCH()}
-
-function drawE(){const cv=$('kc');if(!cv)return;const ctx=cv.getContext('2d'),dpr=devicePixelRatio||1,w=cv.offsetWidth,h=cv.offsetHeight;
-cv.width=w*dpr;cv.height=h*dpr;ctx.scale(dpr,dpr);ctx.clearRect(0,0,w,h);
-ctx.fillStyle='#5e6673';ctx.font='13px sans-serif';ctx.textAlign='center';ctx.textBaseline='middle';
-ctx.fillText('暂无 K 线数据',w/2,h/2);clrCH();L=null}
-
-// ===== 十字光标 =====
-function clrCH(){const cv=$('cc');if(!cv)return;const dpr=devicePixelRatio||1,w=cv.offsetWidth,h=cv.offsetHeight;
-cv.width=w*dpr;cv.height=h*dpr;cv.getContext('2d').scale(dpr,dpr);$('oI').innerText=''}
-function dCH(mx,my){const cv=$('cc');if(!cv||!L)return;
-const dpr=devicePixelRatio||1,w=cv.offsetWidth,h=cv.offsetHeight;
-cv.width=w*dpr;cv.height=h*dpr;const ctx=cv.getContext('2d');ctx.scale(dpr,dpr);
-const{PL,PT,cW,cH,n,bT,D,vb,p2y,y2p,bx}=L;
-const cx=Math.max(PL,Math.min(mx,PL+cW)),cy=Math.max(PT,Math.min(my,PT+cH));
-const idx=Math.max(0,Math.min(Math.round((cx-PL)/bT-.5),n-1)),sx=bx(idx);
-ctx.setLineDash([3,3]);ctx.strokeStyle='rgba(255,255,255,0.25)';ctx.lineWidth=1;
-ctx.beginPath();ctx.moveTo(Math.round(sx)+.5,PT);ctx.lineTo(Math.round(sx)+.5,PT+cH);ctx.stroke();
-ctx.beginPath();ctx.moveTo(PL,Math.round(cy)+.5);ctx.lineTo(PL+cW,Math.round(cy)+.5);ctx.stroke();
-ctx.setLineDash([]);
-const pr=y2p(cy);ctx.fillStyle='#2b3139';
-const tW2=64,tH2=18,tX2=PL+cW+2,tY2=Math.round(cy)-tH2/2;
-ctx.beginPath();ctx.roundRect(tX2,tY2,tW2,tH2,3);ctx.fill();
-ctx.fillStyle='#eaecef';ctx.font='11px "SF Mono",Menlo,monospace';ctx.textAlign='center';ctx.textBaseline='middle';
-ctx.fillText(pr.toFixed(D),tX2+tW2/2,Math.round(cy));
-if(idx>=0&&idx<n){const b=vb[idx],ts=b[0],d=new Date(ts+8*3600000);
-let lb;if(TF==='1hour')lb=(d.getUTCMonth()+1)+'/'+d.getUTCDate()+' '+String(d.getUTCHours()).padStart(2,'0')+':00';
-else lb=String(d.getUTCHours()).padStart(2,'0')+':'+String(d.getUTCMinutes()).padStart(2,'0');
-const tw=ctx.measureText(lb).width+12,tx=Math.round(sx)-tw/2,ty=PT+cH+2;
-ctx.fillStyle='#2b3139';ctx.beginPath();ctx.roundRect(tx,ty,tw,16,3);ctx.fill();
-ctx.fillStyle='#eaecef';ctx.font='10px "SF Mono",Menlo,monospace';ctx.textAlign='center';ctx.textBaseline='top';
-ctx.fillText(lb,Math.round(sx),ty+2);
-const o=b[1],hi=b[2],lo=b[3],cl=b[4],up=cl>=o,c2=up?'#0ecb81':'#f6465d';
-$('oI').innerHTML=`<span style="color:${c2}">O:${o.toFixed(D)} H:${hi.toFixed(D)} L:${lo.toFixed(D)} C:${cl.toFixed(D)}</span>`}}
-
-(function(){const wr=$('cW');if(!wr)return;
-function pos(e){const r=wr.getBoundingClientRect();return e.touches?{x:e.touches[0].clientX-r.left,y:e.touches[0].clientY-r.top}:{x:e.clientX-r.left,y:e.clientY-r.top}}
-wr.addEventListener('mousemove',e=>{const p=pos(e);dCH(p.x,p.y)});
-wr.addEventListener('mouseleave',()=>clrCH());
-wr.addEventListener('touchmove',e=>{e.preventDefault();const p=pos(e);dCH(p.x,p.y)},{passive:false});
-wr.addEventListener('touchend',()=>clrCH())})();
+function stf(b){document.querySelectorAll('.tf').forEach(t=>t.classList.remove('on'));b.classList.add('on');TF=b.dataset.tf;
+vStart=0;vBars=60;fK()}
 
 function lSig(v){const s=$('lS');if(!s)return;s.className='sg';
 if(v<500)s.classList.add('g');else if(v<2000)s.classList.add('y');else s.classList.add('r')}
@@ -1305,9 +1722,30 @@ function chkS(){const p=parseFloat($('mP')?.innerText)||0;
 if(sigP===p&&p>0){stag++;if(stag>=5){const s=$('lS');if(s){s.className='sg';s.classList.add('r')}$('lT').innerText='数据停滞!'}}
 else stag=0;sigP=p}
 
-tick();setInterval(tick,1000);rf();setInterval(rf,2000);setInterval(chkS,2000);
-fK();setInterval(fK,2000);
-addEventListener('resize',()=>{clearTimeout(window._rt);window._rt=setTimeout(()=>{if(cBars.length)drawK(cBars);else drawE()},100)});
+// 实时更新：追加新 bar，跟随最新（如果当前在看最新）
+let lastKlineLen=0;
+const origFetchKline=fK;
+setInterval(async()=>{
+try{
+const maxLimit=TF==='5min'?300:TF==='10min'?250:200;
+const r=await fetch('/api/kline?symbol='+encodeURIComponent(S)+'&tf='+encodeURIComponent(TF)+'&limit='+maxLimit);
+if(!r.ok)return;
+const d=await r.json();
+if(!d.bars||!d.bars.length)return;
+const newBars=d.bars;
+if(newBars.length===lastKlineLen)return;
+const wasAtEnd=(cBars.length===0)||(Math.abs((vStart+vBars)-cBars.length)<2);
+cBars=newBars;lastKlineLen=cBars.length;
+const scrollable=Math.max(0,cBars.length-vBars);
+vStart=wasAtEnd?scrollable:Math.min(vStart,scrollable);
+drawK();
+}catch(e){}
+},2000);
+
+setInterval(rf,2000);setInterval(chkS,2000);
+tick();setInterval(tick,1000);
+addEventListener('resize',()=>{clearTimeout(window._rt);window._rt=setTimeout(()=>{if(cBars.length)drawK();else drawE()},100)});
+rf();fK();
 </script>
 </body></html>
 """
