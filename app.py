@@ -23,6 +23,7 @@ MYSQL_PASS = os.environ.get("MYSQL_PASSWORD", "")
 MYSQL_DB   = os.environ.get("MYSQL_DATABASE", "mt4data")
 
 _pool = None
+_db_ok = False  # Track whether DB is available
 
 def get_pool():
     global _pool
@@ -30,9 +31,9 @@ def get_pool():
         _pool = PooledDB(
             creator=pymysql,
             maxconnections=10,
-            mincached=2,
+            mincached=0,       # ★ Don't connect on pool creation
             maxcached=5,
-            blocking=True,
+            blocking=False,    # ★ Don't block if pool exhausted
             host=MYSQL_HOST,
             port=MYSQL_PORT,
             user=MYSQL_USER,
@@ -41,6 +42,7 @@ def get_pool():
             charset="utf8mb4",
             cursorclass=DictCursor,
             autocommit=True,
+            connect_timeout=3, # ★ 3s timeout, don't block worker
         )
     return _pool
 
@@ -48,6 +50,7 @@ def get_conn():
     return get_pool().connection()
 
 def init_db():
+    global _db_ok
     try:
         conn = get_conn()
         with conn.cursor() as cur:
@@ -66,9 +69,14 @@ def init_db():
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
             """)
         conn.close()
+        _db_ok = True
         print("[DB] tick_logs ready")
     except Exception as e:
+        _db_ok = False
         print(f"[DB] init failed (will retry): {e}")
+
+# ★ Run init_db at module load (works with gunicorn)
+threading.Thread(target=init_db, daemon=True).start()
 
 # ==================== 写入缓冲区 ====================
 FLUSH_SIZE = 50
@@ -94,6 +102,13 @@ def _flush_buf():
     threading.Thread(target=_do_insert, args=(batch,), daemon=True).start()
 
 def _do_insert(batch):
+    global _db_ok
+    if not _db_ok:
+        # Try to init DB on first successful insert
+        try:
+            init_db()
+        except Exception:
+            return
     try:
         conn = get_conn()
         with conn.cursor() as cur:
@@ -103,7 +118,9 @@ def _do_insert(batch):
                 batch
             )
         conn.close()
+        _db_ok = True
     except Exception as e:
+        _db_ok = False
         print(f"[DB] batch insert failed ({len(batch)}): {e}")
 
 def _flush_timer():
@@ -122,6 +139,11 @@ kline_data = {}
 kline_locks = {}
 latest_quotes = {}
 quotes_lock = threading.Lock()
+
+# ★ Diagnostic counters
+_tick_recv_count = 0
+_tick_recv_lock = threading.Lock()
+_last_tick_at = None
 
 # ==================== 品种名归一化 ====================
 KNOWN_SYMBOLS = set()
@@ -423,6 +445,13 @@ def _process_tick(tick):
 
     # 3) MySQL buffer
     _buf_append((norm, bid_f, ask_f, spread, mid, ts_ms, now_str))
+
+    # 4) counter
+    global _tick_recv_count, _last_tick_at
+    with _tick_recv_lock:
+        _tick_recv_count += 1
+        _last_tick_at = now_dt.strftime("%Y-%m-%d %H:%M:%S")
+
     return norm
 
 
@@ -598,6 +627,10 @@ def api_debug_symbols():
 
 @app.route("/api/debug/db", methods=["GET"])
 def api_debug_db():
+    if not _db_ok:
+        with _buf_lock:
+            buf_size = len(_write_buf)
+        return jsonify({"db_ok": False, "error": "DB not connected", "buffer_pending": buf_size})
     try:
         conn = get_conn()
         with conn.cursor() as cur:
@@ -611,6 +644,25 @@ def api_debug_db():
         return jsonify({"db_ok": True, "total_rows": total, "distinct_symbols": syms, "buffer_pending": buf_size})
     except Exception as e:
         return jsonify({"db_ok": False, "error": str(e)})
+
+
+@app.route("/api/health", methods=["GET"])
+def api_health():
+    """Diagnostic endpoint - shows whether data is flowing"""
+    with _tick_recv_lock:
+        cnt = _tick_recv_count
+        last = _last_tick_at
+    with quotes_lock:
+        syms = list(latest_quotes.keys())
+    return jsonify({
+        "status": "ok",
+        "ticks_received": cnt,
+        "last_tick_at": last,
+        "symbols_cached": len(syms),
+        "symbols": syms[:20],
+        "db_ok": _db_ok,
+        "db_host": MYSQL_HOST,
+    })
 
 
 # ==================== 最新状态 ====================
@@ -1047,6 +1099,5 @@ def index():
 
 # ==================== 启动 ====================
 if __name__ == "__main__":
-    init_db()
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=True)
