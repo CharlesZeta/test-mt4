@@ -8,7 +8,127 @@ from datetime import datetime
 from collections import deque
 from flask import Flask, request, render_template_string, jsonify
 
+# ==================== MySQL (optional) ====================
+try:
+    import pymysql
+    from pymysql.cursors import DictCursor
+    from dbutils.pooled_db import PooledDB
+    HAS_MYSQL = True
+except ImportError:
+    HAS_MYSQL = False
+    print("[DB] pymysql/dbutils not installed, MySQL features disabled")
+
 app = Flask(__name__)
+
+# ==================== MySQL 连接池 (可选) ====================
+import os as _os
+MYSQL_HOST = _os.environ.get("MYSQL_HOST", "127.0.0.1")
+MYSQL_PORT = int(_os.environ.get("MYSQL_PORT", 3306))
+MYSQL_USER = _os.environ.get("MYSQL_USER", "root")
+MYSQL_PASS = _os.environ.get("MYSQL_PASSWORD", "")
+MYSQL_DB   = _os.environ.get("MYSQL_DATABASE", "mt4data")
+
+_pool = None
+_db_ok = False
+
+def get_pool():
+    global _pool
+    if not HAS_MYSQL:
+        return None
+    if _pool is None:
+        _pool = PooledDB(
+            creator=pymysql, maxconnections=10, mincached=0, maxcached=5,
+            blocking=False, host=MYSQL_HOST, port=MYSQL_PORT,
+            user=MYSQL_USER, passwd=MYSQL_PASS, db=MYSQL_DB,
+            charset="utf8mb4", cursorclass=DictCursor, autocommit=True,
+            connect_timeout=3,
+        )
+    return _pool
+
+def get_conn():
+    p = get_pool()
+    if p is None:
+        raise RuntimeError("MySQL not available")
+    return p.connection()
+
+def init_db():
+    global _db_ok
+    if not HAS_MYSQL:
+        return
+    try:
+        conn = get_conn()
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS tick_logs (
+                    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                    symbol VARCHAR(20) NOT NULL,
+                    bid DOUBLE NOT NULL, ask DOUBLE NOT NULL,
+                    spread DOUBLE DEFAULT 0, mid DOUBLE DEFAULT 0,
+                    tick_time BIGINT NOT NULL,
+                    received_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+                    INDEX idx_sym_time (symbol, tick_time),
+                    INDEX idx_time (tick_time)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """)
+        conn.close()
+        _db_ok = True
+        print("[DB] tick_logs ready")
+    except Exception as e:
+        _db_ok = False
+        print(f"[DB] init failed: {e}")
+
+threading.Thread(target=init_db, daemon=True).start()
+
+# ---- 写入缓冲 ----
+_write_buf = []
+_buf_lock = threading.Lock()
+_last_flush = time.time()
+
+def _buf_append(row):
+    global _last_flush
+    if not HAS_MYSQL:
+        return
+    with _buf_lock:
+        _write_buf.append(row)
+        if len(_write_buf) >= 50:
+            _flush_buf()
+
+def _flush_buf():
+    global _write_buf, _last_flush
+    if not _write_buf:
+        return
+    batch = _write_buf[:]
+    _write_buf = []
+    _last_flush = time.time()
+    threading.Thread(target=_do_insert, args=(batch,), daemon=True).start()
+
+def _do_insert(batch):
+    global _db_ok
+    try:
+        conn = get_conn()
+        with conn.cursor() as cur:
+            cur.executemany(
+                "INSERT INTO tick_logs (symbol,bid,ask,spread,mid,tick_time,received_at) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s)", batch)
+        conn.close()
+        _db_ok = True
+    except Exception as e:
+        _db_ok = False
+        print(f"[DB] insert failed ({len(batch)}): {e}")
+
+def _flush_timer():
+    while True:
+        time.sleep(2)
+        with _buf_lock:
+            if _write_buf and (time.time() - _last_flush) >= 2:
+                _flush_buf()
+
+threading.Thread(target=_flush_timer, daemon=True).start()
+
+# ---- Diagnostics ----
+_tick_count = 0
+_tick_count_lock = threading.Lock()
+_last_tick_at = None
 
 # ==================== 全局数据结构 ====================
 MAX_HISTORY = 50
@@ -428,40 +548,206 @@ def mt4_commands():
     return jsonify({"commands": []}), 200
 
 # ==================== Tick 推送 ====================
+def _handle_tick_list(ticks):
+    """Shared logic: memory + MySQL for each tick"""
+    count = 0
+    for tick in ticks:
+        sym_raw = tick.get('symbol')
+        bid, ask = tick.get('bid'), tick.get('ask')
+        tt = tick.get('tick_time')
+        if not sym_raw or bid is None or ask is None:
+            continue
+        bf, af = _to_float(bid), _to_float(ask)
+        if bf is None or af is None:
+            continue
+        if tt is not None:
+            tft = float(tt)
+            ts_ms = int(tft) if tft > 1e12 else int(tft * 1000)
+        else:
+            ts_ms = int(time.time() * 1000)
+        spread = _to_float(tick.get('spread')) or 0
+        mid = (bf + af) / 2.0
+        norm = normalize_symbol(sym_raw)
+
+        # 1) memory: kline + quote cache
+        update_kline(sym_raw, bf, af, ts_ms)
+        cache_tick_quote(sym_raw, bf, af, spread=tick.get('spread'), ts=tt)
+
+        # 2) history_report (frontend compat)
+        record = {
+            "received_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "ip": get_client_ip(), "method": "POST", "path": request.path,
+            "category": "report", "headers": {}, "body_raw": json.dumps(tick),
+            "parsed": {"desc":"QUOTE_DATA","spread":tick.get('spread',0),"ts":tt,
+                "message":json.dumps({"bid":bf,"ask":af}),
+                "symbol":sym_raw,"account":"tick_stream"}
+        }
+        with history_lock:
+            history_report.appendleft(record)
+
+        # 3) MySQL buffer
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+        _buf_append((norm, bf, af, spread, mid, ts_ms, now_str))
+
+        # 4) counter
+        global _tick_count, _last_tick_at
+        with _tick_count_lock:
+            _tick_count += 1
+            _last_tick_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        count += 1
+    return count
+
 @app.route('/api/tick', methods=['POST'])
 def receive_tick():
     try:
         ticks = request.json
         if not isinstance(ticks, list): ticks = [ticks]
+        _handle_tick_list(ticks)
+        return '', 204
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/tick-ren', methods=['POST'])
+def tick_ren():
+    try:
+        ticks = request.json
+        if not isinstance(ticks, list): ticks = [ticks]
+        count = _handle_tick_list(ticks)
+        return jsonify({"ok": True, "processed": count}), 200
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+@app.route('/api/tick-hist', methods=['POST'])
+def tick_hist():
+    """Historical batch import: MySQL only, no memory update"""
+    if not HAS_MYSQL:
+        return jsonify({"ok": False, "error": "MySQL not available"}), 503
+    try:
+        ticks = request.json
+        if not isinstance(ticks, list): ticks = [ticks]
+        rows = []
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
         for tick in ticks:
             sym_raw = tick.get('symbol')
             bid, ask = tick.get('bid'), tick.get('ask')
             tt = tick.get('tick_time')
-            if not sym_raw or bid is None or ask is None:
-                continue
+            if not sym_raw or bid is None or ask is None: continue
             bf, af = _to_float(bid), _to_float(ask)
-            if bf is None or af is None:
-                continue
+            if bf is None or af is None: continue
+            spread = _to_float(tick.get('spread')) or 0
             if tt is not None:
                 tft = float(tt)
                 ts_ms = int(tft) if tft > 1e12 else int(tft * 1000)
             else:
                 ts_ms = int(time.time() * 1000)
-            update_kline(sym_raw, bf, af, ts_ms)
-            cache_tick_quote(sym_raw, bf, af, spread=tick.get('spread'), ts=tt)
-            record = {
-                "received_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                "ip": get_client_ip(), "method": "POST", "path": "/api/tick",
-                "category": "report", "headers": {}, "body_raw": json.dumps(tick),
-                "parsed": {"desc":"QUOTE_DATA","spread":tick.get('spread',0),"ts":tt,
-                    "message":json.dumps({"bid":bf,"ask":af}),
-                    "symbol":sym_raw,"account":"tick_stream"}
-            }
-            with history_lock:
-                history_report.appendleft(record)
-        return '', 204
+            mid = (bf + af) / 2.0
+            norm = normalize_symbol(sym_raw)
+            rows.append((norm, bf, af, spread, mid, ts_ms, now_str))
+        if rows:
+            conn = get_conn()
+            with conn.cursor() as cur:
+                cur.executemany(
+                    "INSERT INTO tick_logs (symbol,bid,ask,spread,mid,tick_time,received_at) "
+                    "VALUES (%s,%s,%s,%s,%s,%s,%s)", rows)
+            conn.close()
+        return jsonify({"ok": True, "inserted": len(rows)}), 200
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+# ==================== 历史查询 ====================
+def _parse_ts(val):
+    if not val: return None
+    val = val.strip()
+    if val.isdigit():
+        v = int(val)
+        return v if v > 1e12 else v * 1000
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+        try: return int(datetime.strptime(val, fmt).timestamp() * 1000)
+        except ValueError: continue
+    return None
+
+@app.route('/api/hist', methods=['GET'])
+def api_hist():
+    if not HAS_MYSQL or not _db_ok:
+        return jsonify({"error": "MySQL not available"}), 503
+    symbol = request.args.get("symbol", "").upper()
+    if not symbol: return jsonify({"error": "symbol required"}), 400
+    norm = normalize_symbol(symbol)
+    limit = min(int(request.args.get("limit", 1000)), 10000)
+    agg = request.args.get("agg", "raw")
+    from_ts = _parse_ts(request.args.get("from")) or (int(time.time()*1000) - 3600000)
+    to_ts = _parse_ts(request.args.get("to")) or (int(time.time()*1000) + 60000)
+    try:
+        conn = get_conn()
+        with conn.cursor() as cur:
+            if agg == "raw":
+                cur.execute(
+                    "SELECT symbol,bid,ask,spread,mid,tick_time,received_at FROM tick_logs "
+                    "WHERE symbol=%s AND tick_time>=%s AND tick_time<=%s ORDER BY tick_time ASC LIMIT %s",
+                    (norm, from_ts, to_ts, limit))
+                rows = cur.fetchall()
+                for r in rows:
+                    if isinstance(r.get("received_at"), datetime):
+                        r["received_at"] = r["received_at"].strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+            elif agg in ("1s","5s","1min"):
+                step = {"1s":1000,"5s":5000,"1min":60000}[agg]
+                cur.execute(
+                    "SELECT FLOOR(tick_time/%s)*%s AS ts,"
+                    "SUBSTRING_INDEX(GROUP_CONCAT(mid ORDER BY tick_time ASC),',',1)+0 AS open,"
+                    "MAX(mid) AS high,MIN(mid) AS low,"
+                    "SUBSTRING_INDEX(GROUP_CONCAT(mid ORDER BY tick_time DESC),',',1)+0 AS close,"
+                    "COUNT(*) AS ticks,AVG(spread) AS avg_spread "
+                    "FROM tick_logs WHERE symbol=%s AND tick_time>=%s AND tick_time<=%s "
+                    "GROUP BY FLOOR(tick_time/%s) ORDER BY ts ASC LIMIT %s",
+                    (step,step,norm,from_ts,to_ts,step,limit))
+                rows = cur.fetchall()
+                for r in rows:
+                    r["ts"]=int(r["ts"]); r["open"]=float(r["open"]); r["close"]=float(r["close"])
+            else:
+                return jsonify({"error":"unsupported agg"}),400
+        conn.close()
+        return jsonify({"symbol":norm,"from":from_ts,"to":to_ts,"agg":agg,"count":len(rows),"data":rows})
+    except Exception as e:
+        return jsonify({"error":str(e)}),500
+
+@app.route('/api/hist/stats', methods=['GET'])
+def api_hist_stats():
+    if not HAS_MYSQL or not _db_ok:
+        return jsonify({"error": "MySQL not available"}), 503
+    try:
+        conn = get_conn()
+        with conn.cursor() as cur:
+            cur.execute("SELECT symbol,COUNT(*) AS cnt,MIN(tick_time) AS first_ts,MAX(tick_time) AS last_ts FROM tick_logs GROUP BY symbol ORDER BY cnt DESC")
+            rows = cur.fetchall()
+            for r in rows: r["first_ts"]=int(r["first_ts"]); r["last_ts"]=int(r["last_ts"])
+        conn.close()
+        return jsonify({"symbols":rows,"total_symbols":len(rows)})
+    except Exception as e:
+        return jsonify({"error":str(e)}),500
+
+@app.route("/api/debug/db", methods=["GET"])
+def api_debug_db():
+    if not HAS_MYSQL or not _db_ok:
+        with _buf_lock: bs = len(_write_buf)
+        return jsonify({"db_ok":False,"has_mysql":HAS_MYSQL,"buffer_pending":bs,"host":MYSQL_HOST})
+    try:
+        conn = get_conn()
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) AS total FROM tick_logs")
+            total = cur.fetchone()["total"]
+        conn.close()
+        with _buf_lock: bs = len(_write_buf)
+        return jsonify({"db_ok":True,"total_rows":total,"buffer_pending":bs})
+    except Exception as e:
+        return jsonify({"db_ok":False,"error":str(e)})
+
+@app.route("/api/health", methods=["GET"])
+def api_health():
+    with _tick_count_lock: cnt=_tick_count; last=_last_tick_at
+    with quote_cache_lock: syms=list(latest_quote_cache.keys())
+    return jsonify({"status":"ok","ticks_received":cnt,"last_tick_at":last,
+        "symbols_cached":len(syms),"symbols":syms[:20],"db_ok":_db_ok,"has_mysql":HAS_MYSQL})
 
 # ==================== K线 & 产品接口 ====================
 @app.route("/api/kline", methods=["GET"])
