@@ -3,7 +3,10 @@ flask-cors>=3.0.10
 pytz
 pandas>=1.5
 XlsxWriter
-gunicorn
+gunicorn>=21.2
+pymysql>=1.1
+dbutils>=3.0
+cryptography>=41.0
 
 playwright>=1.48.0
 greenlet>=3.1.0
