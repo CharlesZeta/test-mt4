@@ -1592,10 +1592,13 @@ for(let i=0;i<visibleCount;i++){
   const ts=cBars[barIdx][0],x=bxAt(barIdx);
   if(barIdx!==0&&barIdx!==totalBars-1&&ts%iMs!==0)continue;
   if(x-lX<mG&&barIdx!==0&&barIdx!==totalBars-1)continue;
-  const d=new Date(ts+8*3600000);
+  const d=new Date(ts);
   let lb;
-  if(TF==='1hour')lb=(d.getUTCMonth()+1)+'/'+d.getUTCDate()+' '+String(d.getUTCHours()).padStart(2,'0')+':00';
-  else lb=String(d.getUTCHours()).padStart(2,'0')+':'+String(d.getUTCMinutes()).padStart(2,'0');
+  if(TF==='1hour'){
+    lb=d.toLocaleString('zh-CN',{timeZone:'Asia/Shanghai',month:'numeric',day:'numeric',hour:'2-digit',hour12:false});
+  }else{
+    lb=d.toLocaleString('zh-CN',{timeZone:'Asia/Shanghai',hour:'2-digit',minute:'2-digit',hour12:false});
+  }
   ctx.strokeStyle=gr;ctx.lineWidth=1;
   ctx.beginPath();ctx.moveTo(Math.round(x)+.5,PT+cH);ctx.lineTo(Math.round(x)+.5,PT+cH+4);ctx.stroke();
   ctx.fillStyle=ax;ctx.fillText(lb,x,PT+cH+6);lX=x;
@@ -1655,9 +1658,12 @@ ctx.beginPath();ctx.roundRect(tX2,tY2,tW2,tH2,3);ctx.fill();
 ctx.fillStyle='#eaecef';ctx.font='11px "SF Mono",Menlo,monospace';ctx.textAlign='center';ctx.textBaseline='middle';
 ctx.fillText(pr.toFixed(D),tX2+tW2/2,Math.round(cy));
 if(idx>=0&&idx<totalBars){
-  const b=cBars[idx],ts=b[0],d=new Date(ts+8*3600000);
-  let lb;if(TF==='1hour')lb=(d.getUTCMonth()+1)+'/'+d.getUTCDate()+' '+String(d.getUTCHours()).padStart(2,'0')+':00';
-  else lb=String(d.getUTCHours()).padStart(2,'0')+':'+String(d.getUTCMinutes()).padStart(2,'0');
+  const b=cBars[idx],ts=b[0],d=new Date(ts);
+  let lb;if(TF==='1hour'){
+    lb=d.toLocaleString('zh-CN',{timeZone:'Asia/Shanghai',month:'numeric',day:'numeric',hour:'2-digit',hour12:false});
+  }else{
+    lb=d.toLocaleString('zh-CN',{timeZone:'Asia/Shanghai',hour:'2-digit',minute:'2-digit',hour12:false});
+  }
   const x=bxAtGlobal(idx);
   const tw=ctx.measureText(lb).width+12,tx=Math.round(x)-tw/2,ty=PT+cH+2;
   ctx.fillStyle='#2b3139';ctx.beginPath();ctx.roundRect(tx,ty,tw,16,3);ctx.fill();
