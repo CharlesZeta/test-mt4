@@ -141,19 +141,45 @@ def _flush_buf():
     _last_flush = time.time()
     threading.Thread(target=_do_insert, args=(batch,), daemon=True).start()
 
-def _do_insert(batch):
+def _do_insert(batch, retry_count=0):
+    """
+    批量写入 quote_ticks + upsert latest_quotes。
+    输入 batch 是 list[dict]，每个 dict 包含：
+    symbol, bid, ask, spread, received_at, _retry_count(可选)
+    失败时会回灌一次，retry_count>=2 时不再回灌。
+    """
     global _db_ok
+    if not batch:
+        return
     try:
         conn = get_conn()
         with conn.cursor() as cur:
+            rows = [(d["symbol"], d["bid"], d["ask"], d.get("spread") or 0.0, d["received_at"]) for d in batch]
             cur.executemany(
-                "INSERT INTO tick_logs (symbol,bid,ask,spread,mid,tick_time,received_at) "
-                "VALUES (%s,%s,%s,%s,%s,%s,%s)", batch)
+                "INSERT INTO quote_ticks (symbol,bid,ask,spread,received_at) "
+                "VALUES (%s,%s,%s,%s,%s)", rows)
+            upsert = (
+                "INSERT INTO latest_quotes (symbol,bid,ask,spread,received_at) "
+                "VALUES (%s,%s,%s,%s,%s) "
+                "ON DUPLICATE KEY UPDATE "
+                "bid=VALUES(bid), ask=VALUES(ask), spread=VALUES(spread), received_at=VALUES(received_at)"
+            )
+            cur.executemany(upsert, rows)
         conn.close()
         _db_ok = True
     except Exception as e:
         _db_ok = False
-        print(f"[DB] insert failed ({len(batch)}): {e}")
+        print(f"[DB] _do_insert failed ({len(batch)}): {repr(e)}")
+        # 失败时回灌一次，最多重试一次
+        if retry_count < 1:
+            print(f"[DB] batch requeued (retry {retry_count + 1})")
+            def requeue():
+                global _write_buf
+                with _buf_lock:
+                    _write_buf = batch + _write_buf
+            requeue()
+        else:
+            print(f"[DB] batch dropped after max retries ({len(batch)} rows)")
 
 def _flush_timer():
     while True:
@@ -174,9 +200,18 @@ MAX_HISTORY = 50
 KLINE_MAX = {"5min": 300, "10min": 250, "1hour": 200}
 kline_data = {}
 kline_locks = {}
+kline_locks_guard = threading.Lock()  # 保护 kline_locks 创建
 
 # ==================== 品种名归一化（核心修复） ====================
 KNOWN_SYMBOLS = set()
+
+def get_kline_lock(symbol):
+    """获取 symbol 对应的锁，线程安全"""
+    if symbol not in kline_locks:
+        with kline_locks_guard:
+            if symbol not in kline_locks:  # 双重检查
+                kline_locks[symbol] = threading.Lock()
+    return kline_locks[symbol]
 
 def normalize_symbol(raw_symbol: str) -> str:
     """
@@ -203,11 +238,6 @@ def normalize_symbol(raw_symbol: str) -> str:
         if candidate in KNOWN_SYMBOLS:
             return candidate
     return s
-
-def get_kline_lock(symbol):
-    if symbol not in kline_locks:
-        kline_locks[symbol] = threading.Lock()
-    return kline_locks[symbol]
 
 def _floor_ts(ts_ms, tf):
     if tf == "5min":     step = 5 * 60 * 1000
@@ -285,11 +315,16 @@ def make_quote_row(raw_symbol, bid, ask, spread=None):
     }
 
 # ==================== 时间戳工具 ====================
-def to_tick_ts_ms(ts_value):
+# 上游行情时间偏移配置（小时），用于修正 broker 本地时间与 UTC 的差值
+SOURCE_TS_OFFSET_HOURS = int(os.environ.get("SOURCE_TS_OFFSET_HOURS", "0"))
+SOURCE_TS_OFFSET_MS = SOURCE_TS_OFFSET_HOURS * 3600 * 1000
+
+def to_tick_ts_ms(ts_value, apply_source_offset=True):
     """
     将任意形式的时间值统一转换为毫秒时间戳。
     支持：None、秒级 int/float、毫秒级 int/float、字符串数字。
     大于 1e12 视为毫秒，否则视为秒。
+    如果 apply_source_offset=True 且配置了偏移，则减去 SOURCE_TS_OFFSET_MS。
     """
     if ts_value is None:
         return None
@@ -297,9 +332,10 @@ def to_tick_ts_ms(ts_value):
         v = float(ts_value)
     except (TypeError, ValueError):
         return None
-    if v > 1e12:
-        return int(v)
-    return int(v * 1000)
+    result = int(v) if v > 1e12 else int(v * 1000)
+    if apply_source_offset and SOURCE_TS_OFFSET_MS:
+        result -= SOURCE_TS_OFFSET_MS
+    return result
 
 def ts_ms_to_shanghai_str(ts_ms):
     """毫秒时间戳 → 东八区字符串（精确到毫秒）"""
@@ -311,13 +347,20 @@ def ts_ms_to_shanghai_str(ts_ms):
     except (ValueError, OSError, OverflowError):
         return ""
 
+def ts_ms_to_db_str(ts_ms):
+    """
+    毫秒时间戳 → 东八区数据库查询字符串（精确到毫秒）。
+    专用于 /api/quote-hist 的 SQL 字符串时间比较。
+    """
+    return ts_ms_to_shanghai_str(ts_ms)
+
 def build_latency_fields(ts_value):
     """
     给定行情原始 ts，生成时差比对信息。
     返回：quote_ts_ms, quote_time_shanghai, server_ts_ms,
           server_time_shanghai, latency_ms, is_stale
     """
-    quote_ts_ms = to_tick_ts_ms(ts_value)
+    quote_ts_ms = to_tick_ts_ms(ts_value)  # 自动应用 SOURCE_TS_OFFSET_MS
     now_dt = now_shanghai_dt()
     server_ts_ms = int(now_dt.timestamp() * 1000)
     server_time_shanghai = now_shanghai_str()
@@ -657,6 +700,10 @@ def api_latest_status():
             pd = pr.get("parsed", {})
             detail = {"received_at":pr.get("received_at"),"account":pd.get("account"),"server":pd.get("server"),
                 "positions":pd.get("positions") or []}
+
+    # 补充时差字段
+    if latest_quote and isinstance(latest_quote, dict):
+        latest_quote.update(build_latency_fields(latest_quote.get("ts")))
 
     return jsonify({"detail":detail,"latest_quote":latest_quote})
 
@@ -1035,15 +1082,17 @@ def api_quote_hist():
     default_to = int(now_sh.timestamp() * 1000) + 60000       # 1分钟后
     from_ts = _parse_ts(request.args.get("from")) or default_from
     to_ts = _parse_ts(request.args.get("to")) or default_to
+    # 转为东八区字符串，避免 MySQL FROM_UNIXTIME 时区依赖
+    from_str = ts_ms_to_db_str(from_ts)
+    to_str = ts_ms_to_db_str(to_ts)
     try:
         conn = get_conn()
         with conn.cursor() as cur:
             cur.execute(
                 "SELECT symbol,bid,ask,spread,received_at FROM quote_ticks "
-                "WHERE symbol=%s AND received_at>=FROM_UNIXTIME(%s/1000) "
-                "AND received_at<=FROM_UNIXTIME(%s/1000) "
+                "WHERE symbol=%s AND received_at>=%s AND received_at<=%s "
                 "ORDER BY received_at ASC LIMIT %s",
-                (norm, from_ts, to_ts, limit))
+                (norm, from_str, to_str, limit))
             rows = cur.fetchall()
         conn.close()
         formatted = []
@@ -1094,7 +1143,10 @@ def api_debug_quotes_db():
 
 @app.route("/api/stream/quote", methods=["GET"])
 def stream_quote():
-    """SSE 持续推送指定 symbol 的实时报价（内存）"""
+    """
+    SSE 持续推送指定 symbol 的实时报价（内存）。
+    注意：该接口适合少量客户端，高频大量客户端不建议直接使用。
+    """
     from flask import Response
     symbol = request.args.get("symbol", "").strip()
     if not symbol:
@@ -1104,48 +1156,88 @@ def stream_quote():
         return jsonify({"error": f"unknown symbol: {norm}"}), 400
 
     last_payload_str = ""
+    heartbeat_counter = 0
 
     def generate():
-        nonlocal last_payload_str
-        while True:
-            with quote_cache_lock:
-                q = latest_quote_cache.get(norm)
-            if q:
-                payload = build_live_quote_payload(dict(q))
-                if payload:
-                    s = json.dumps(payload, ensure_ascii=False)
-                    if s != last_payload_str:
-                        last_payload_str = s
-                        yield f"data: {s}\n\n"
-            time.sleep(0.2)
+        nonlocal last_payload_str, heartbeat_counter
+        try:
+            while True:
+                with quote_cache_lock:
+                    q = latest_quote_cache.get(norm)
+                if q:
+                    payload = build_live_quote_payload(dict(q))
+                    if payload:
+                        s = json.dumps(payload, ensure_ascii=False)
+                        if s != last_payload_str:
+                            last_payload_str = s
+                            heartbeat_counter = 0
+                            yield f"data: {s}\n\n"
+                # 每 15 次循环（约 3 秒）发送一次心跳
+                heartbeat_counter += 1
+                if heartbeat_counter % 15 == 0:
+                    yield ": ping\n\n"
+                time.sleep(0.2)
+        except GeneratorExit:
+            pass  # 客户端断开
+        except Exception as e:
+            print(f"[SSE] stream_quote error: {repr(e)}")
 
     return Response(generate(), mimetype="text/event-stream",
                    headers={"X-Accel-Buffering": "no"})
 
 @app.route("/api/stream/quotes", methods=["GET"])
 def stream_quotes():
-    """SSE 持续推送全市场实时报价快照（内存）"""
+    """
+    SSE 持续推送全市场实时报价快照（内存）。
+    支持参数：
+    - limit: 只推送前 N 个 symbol（默认全部）
+    - symbols: 逗号分隔的 symbol 列表，只监听指定品种
+    注意：该接口适合少量客户端，高频大量客户端不建议直接使用。
+    """
     from flask import Response
+    # 可选参数：只推前 N 个，或只推指定品种
+    limit_str = request.args.get("limit", "")
+    limit_n = int(limit_str) if limit_str.isdigit() else None
+    symbols_str = request.args.get("symbols", "")
+    symbols_filter = set(symbols_str.upper().split(",")) if symbols_str else None
+
     last_payload_str = ""
+    heartbeat_counter = 0
 
     def generate():
-        nonlocal last_payload_str
-        while True:
-            with quote_cache_lock:
-                items = list(latest_quote_cache.items())
-            server_time = now_shanghai_str()
-            data = []
-            for sym, q in items:
-                p = build_live_quote_payload(dict(q))
-                if p:
-                    data.append(p)
-            data.sort(key=lambda x: x["symbol"])
-            payload = {"count": len(data), "server_time_shanghai": server_time, "data": data}
-            s = json.dumps(payload, ensure_ascii=False)
-            if s != last_payload_str:
-                last_payload_str = s
-                yield f"data: {s}\n\n"
-            time.sleep(0.5)
+        nonlocal last_payload_str, heartbeat_counter
+        try:
+            while True:
+                with quote_cache_lock:
+                    items = list(latest_quote_cache.items())
+                server_time = now_shanghai_str()
+                data = []
+                for sym, q in items:
+                    # 过滤 symbol
+                    if symbols_filter and sym not in symbols_filter:
+                        continue
+                    p = build_live_quote_payload(dict(q))
+                    if p:
+                        data.append(p)
+                data.sort(key=lambda x: x["symbol"])
+                # 限制数量
+                if limit_n:
+                    data = data[:limit_n]
+                payload = {"count": len(data), "server_time_shanghai": server_time, "data": data}
+                s = json.dumps(payload, ensure_ascii=False)
+                if s != last_payload_str:
+                    last_payload_str = s
+                    heartbeat_counter = 0
+                    yield f"data: {s}\n\n"
+                # 每 30 次循环（约 15 秒）发送一次心跳
+                heartbeat_counter += 1
+                if heartbeat_counter % 30 == 0:
+                    yield ": ping\n\n"
+                time.sleep(0.5)
+        except GeneratorExit:
+            pass  # 客户端断开
+        except Exception as e:
+            print(f"[SSE] stream_quotes error: {repr(e)}")
 
     return Response(generate(), mimetype="text/event-stream",
                    headers={"X-Accel-Buffering": "no"})
@@ -1167,7 +1259,7 @@ def api_health():
 # ==================== K线 & 产品接口 ====================
 @app.route("/api/kline", methods=["GET"])
 def api_kline():
-    symbol = request.args.get("symbol", "XAUUSD").upper()
+    symbol = normalize_symbol(request.args.get("symbol", "XAUUSD").upper())
     tf = request.args.get("tf", "5min")
     if tf not in KLINE_MAX: tf = "5min"
     limit = min(request.args.get("limit", KLINE_MAX[tf], type=int), KLINE_MAX[tf])
@@ -1639,10 +1731,15 @@ if(newVBars!==vBars){
   const wrap=$('cW');if(!wrap)return;
   const rect=wrap.getBoundingClientRect();
   const relX=midX-rect.left;
-  const frac=relX/L.cW;
-  vBars=newVBars;
-  const scrollable=cBars.length-vBars;
-  vStart=scrollable>0?Math.max(0,Math.min(midIdx-frac*vBars,scrollable)):0;
+  if(L&&L.cW>0){
+    const frac=relX/L.cW;
+    const midIdx=vStart+frac*vBars;  // 正确计算双指中心对应的 bar 索引
+    vBars=newVBars;
+    const scrollable=cBars.length-vBars;
+    vStart=scrollable>0?Math.max(0,Math.min(midIdx-frac*vBars,scrollable)):0;
+  }else{
+    vBars=newVBars;
+  }
   lastPinchDist=dist;
   drawK();
 }else{
@@ -1693,7 +1790,14 @@ wr.addEventListener('touchend',e=>{
 })();
 
 // ==================== 业务逻辑 ====================
-function tick(){const n=new Date();$('clk').innerText=[n.getHours(),n.getMinutes(),n.getSeconds()].map(v=>String(v).padStart(2,'0')).join(':')}
+function tick(){
+  // 使用东八区时间显示
+  const now=new Date();
+  const hour=now.toLocaleString('zh-CN',{timeZone:'Asia/Shanghai',hour:'2-digit',hour12:false});
+  const minute=now.toLocaleString('zh-CN',{timeZone:'Asia/Shanghai',minute:'2-digit',hour12:false});
+  const second=now.toLocaleString('zh-CN',{timeZone:'Asia/Shanghai',second:'2-digit',hour12:false});
+  $('clk').innerText=[hour,minute,second].map(v=>v.padStart(2,'0')).join(':');
+}
 function stab(b,c){document.querySelectorAll('.tab').forEach(t=>t.classList.remove('on'));b.classList.add('on');C=c}
 function openM(){$('mTi').innerText='切换'+(CN[C]||'品种');
 $('mLi').innerHTML=(CP[C]||[]).map(s=>`<div class="it ${s===S?'on':''}" onclick="pick('${s}')"><span>${s}</span></div>`).join('');
@@ -1725,12 +1829,29 @@ const pe=$('mP');pe.classList.remove('up','down');
 if(prev!=null){if(mid>prev)pe.classList.add('up');else if(mid<prev)pe.classList.add('down')}
 const sp=q.spread!=null?q.spread:((a-b)*Math.pow(10,D>2?0:(5-D))).toFixed(1);
 $('sV').innerText=sp;$('sT').innerText='点差: '+sp}
-if(q.ts!=null){const t=Number(q.ts),sMs=t<1e12?t*1000:t,now=Date.now(),lat=Math.round(now-sMs);
-if(Number.isFinite(sMs)&&Number.isFinite(lat)&&Math.abs(lat)<=600000){$('lT').innerText='延迟: '+lat+'ms';lSig(lat)}
-else{$('lT').innerText='延迟: --';lSig(99999)}
-const dt=new Date(sMs);
-$('uT').innerText='数据: '+dt.toLocaleString('zh-CN',{hour12:false,timeZone:'Asia/Shanghai',year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit'}).replace(/\//g,'-')}
-else if(q.received_at)$('uT').innerText='更新: '+(q.received_at.split(' ')[1]||'--')
+// 优先使用后端返回的时差字段
+if(q.latency_ms!=null&&Number.isFinite(q.latency_ms)){
+  const lat=Math.round(q.latency_ms);
+  if(Math.abs(lat)<=600000){$('lT').innerText='延迟: '+lat+'ms';lSig(lat)}
+  else{$('lT').innerText='延迟: --';lSig(99999)}
+}else if(q.quote_time_shanghai){
+  // 后端没有 latency 但有 quote_time_shanghai，显示更新时间
+  const t=q.quote_time_shanghai.split(' ')[1]||q.quote_time_shanghai;
+  $('lT').innerText='更新: '+t;lSig(99999);
+}else{
+  $('lT').innerText='延迟: --';lSig(99999);
+}
+// 优先使用后端返回的东八区时间
+if(q.quote_time_shanghai){
+  $('uT').innerText='数据: '+q.quote_time_shanghai;
+}else if(q.server_time_shanghai){
+  $('uT').innerText='数据: '+q.server_time_shanghai;
+}else if(q.received_at){
+  const t=q.received_at.split(' ')[1]||q.received_at;
+  $('uT').innerText='更新: '+t;
+}else{
+  $('uT').innerText='数据: --';
+}
 }}catch(e){console.error(e);cOk(false)}}
 
 async function fK(){
@@ -1778,7 +1899,7 @@ drawK();
 }catch(e){}
 },2000);
 
-setInterval(rf,2000);setInterval(chkS,2000);
+setInterval(chkS,2000);
 tick();setInterval(tick,1000);
 addEventListener('resize',()=>{clearTimeout(window._rt);window._rt=setTimeout(()=>{if(cBars.length)drawK();else drawE()},100)});
 rf();fK();
@@ -1792,4 +1913,5 @@ def index():
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port, debug=True)
+    debug_mode = os.environ.get("FLASK_DEBUG", "0") == "1"
+    app.run(host="0.0.0.0", port=port, debug=debug_mode)
