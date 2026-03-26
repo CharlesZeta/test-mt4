@@ -1124,9 +1124,9 @@ var _SH_OFF=8*3600*1000;
 function shTime(ts){var d=new Date(ts+_SH_OFF);return{Y:d.getUTCFullYear(),Mo:d.getUTCMonth()+1,D:d.getUTCDate(),h:d.getUTCHours(),m:d.getUTCMinutes(),s:d.getUTCSeconds()}}
 function _p2(n){return String(n).padStart(2,'0')}
 function fmtSH(ts,fmt){var t=shTime(ts);if(fmt==='HH:mm')return _p2(t.h)+':'+_p2(t.m);if(fmt==='M/D HH:mm')return t.Mo+'/'+_p2(t.D)+' '+_p2(t.h)+':'+_p2(t.m);if(fmt==='HH:mm:ss')return _p2(t.h)+':'+_p2(t.m)+':'+_p2(t.s);return t.Y+'-'+_p2(t.Mo)+'-'+_p2(t.D)+' '+_p2(t.h)+':'+_p2(t.m)+':'+_p2(t.s)}
+var $=function(id){return document.getElementById(id)};
 function applyThemeByShanghaiTime(){var h=shTime(Date.now()).h;if(h>=20||h<6){document.documentElement.classList.remove('light')}else{document.documentElement.classList.add('light')}if(cBars&&cBars.length)drawK();else drawE()}
 applyThemeByShanghaiTime();setInterval(applyThemeByShanghaiTime,60000);
-var $=function(id){return document.getElementById(id)};
 var CP={forex:["EURUSD","GBPUSD","USDJPY","USDCHF","AUDUSD","USDCAD","NZDUSD","EURGBP","EURJPY","GBPJPY","AUDJPY","EURAUD","EURCHF","GBPCHF","CHFJPY","CADJPY","AUDNZD","AUDCAD","AUDCHF","EURNZD","EURCAD","CADCHF","NZDJPY","GBPAUD","GBPCAD","GBPNZD","NZDCAD","NZDCHF","USDSGD","USDHKD","USDCNH"],metal:["XAUUSD","XAGUSD"],commodity:["UKOUSD","USOUSD"],index:["U30USD","NASUSD","SPXUSD","100GBP","D30EUR","E50EUR","H33HKD"],crypto:["BTCUSD","ETHUSD","LTCUSD","BCHUSD","XMRUSD","BNBUSD","SOLUSD","ADAUSD","DOGUSD","XSIUSD","AVEUSD","DSHUSD","RPLUSD","LNKUSD"],stock:["AAPL","AMZN","BABA","GOOGL","META","MSFT","NFLX","NVDA","TSLA","ABBV","ABNB","ABT","ADBE","AMD","AVGO","C","CRM","DIS","GS","INTC","JNJ","MA","MCD","KO","MMM","NIO","PLTR","SHOP","TSM","V"]};
 var CN={forex:"外汇",metal:"贵金属",commodity:"大宗商品",index:"指数",crypto:"虚拟货币",stock:"股票"};
 var S="EURUSD",C="forex",TF="5min",lastM=null,stag=0,sigP=0;
