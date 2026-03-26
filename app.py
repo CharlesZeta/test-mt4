@@ -1419,6 +1419,7 @@ const fx=["USD","GBP","EUR","JPY","CHF","AUD","NZD","CAD","HKD","SGD","CNH"];
 if(!fx.some(c=>u.includes(c)))return 2;
 return 5;}
 function fm(n,d){return n!=null?parseFloat(n).toFixed(d):'--'}
+}
 
 function nS(lo,hi,mt){
 if(lo===hi){const d=lo===0?1:Math.abs(lo)*.01;lo-=d;hi+=d}
