@@ -113,44 +113,7 @@ def init_db():
         _db_ok = False
         print(f"[DB] init failed: {e}")
 
-def rebuild_kline_from_db():
-    """服务启动时从 MySQL quote_ticks 表重建内存 K 线缓存"""
-    global _db_ok
-    if not HAS_MYSQL:
-        return
-
-    # ★ 修复：等待 init_db 完成，最多等 10 秒
-    for _ in range(20):
-        if _db_ok:
-            break
-        time.sleep(0.5)
-
-    if not _db_ok:
-        print("[Kline] skipped rebuild: DB not ready after waiting")
-        return
-
-    try:
-        conn = get_conn()
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT symbol, bid, ask,
-                       UNIX_TIMESTAMP(received_at)*1000 AS ts_ms
-                FROM quote_ticks
-                WHERE received_at >= NOW() - INTERVAL 24 HOUR
-                ORDER BY received_at ASC
-            """)
-            rows = cur.fetchall()
-        conn.close()
-
-        for r in rows:
-            mid = (r['bid'] + r['ask']) / 2.0
-            update_kline(r['symbol'], r['bid'], r['ask'], int(r['ts_ms']))
-        print(f"[Kline] rebuilt from DB: {len(rows)} ticks")
-    except Exception as e:
-        print(f"[Kline] rebuild failed: {e}")
-
 threading.Thread(target=init_db, daemon=True).start()
-threading.Thread(target=rebuild_kline_from_db, daemon=True).start()
 
 # ---- 写入缓冲 ----
 _write_buf = []
@@ -328,6 +291,11 @@ SOURCE_TS_OFFSET_HOURS = int(os.environ.get("SOURCE_TS_OFFSET_HOURS", "0"))
 SOURCE_TS_OFFSET_MS = SOURCE_TS_OFFSET_HOURS * 3600 * 1000
 
 def to_tick_ts_ms(ts_value, apply_source_offset=True):
+    """
+    将任意形式的时间值统一转换为毫秒时间戳（UTC）。
+    大于 1e12 视为毫秒，否则视为秒。
+    如果 apply_source_offset=True 且配置了偏移，则减去 SOURCE_TS_OFFSET_MS。
+    """
     if ts_value is None:
         return None
     try:
@@ -732,6 +700,7 @@ def _handle_tick_list(ticks):
         if bf is None or af is None:
             continue
 
+        # ★ 修复 Bug2：统一走 to_tick_ts_ms() 以正确应用 SOURCE_TS_OFFSET_MS
         ts_ms = to_tick_ts_ms(tt)
         if ts_ms is None:
             ts_ms = int(time.time() * 1000)
@@ -807,6 +776,7 @@ def tick_hist():
             if bf is None or af is None: continue
             spread = _to_float(tick.get('spread')) or 0
 
+            # ★ 修复 Bug2：统一走 to_tick_ts_ms()
             ts_ms = to_tick_ts_ms(tt)
             if ts_ms is None:
                 ts_ms = int(time.time() * 1000)
@@ -1352,9 +1322,12 @@ align-items:center;border-radius:.5rem;cursor:pointer;transition:.1s;color:var(-
 </div>
 
 <script>
-const _SH_OFF = 8 * 3600 * 1000;
+// ==================== 东八区时间工具（稳定跨浏览器，不依赖 toLocaleString）====================
+// ★ 修复 Bug1: Safari/iOS 的 toLocaleString 返回 "上午9" 导致 parseInt 为 NaN
+const _SH_OFF = 8 * 3600 * 1000; // UTC+8，无夏令时
 
 function shTime(tsMs) {
+  // 将任意毫秒时间戳转为东八区时间分量
   const d = new Date(tsMs + _SH_OFF);
   return {
     Y:  d.getUTCFullYear(),
@@ -1368,6 +1341,10 @@ function shTime(tsMs) {
 
 function _p2(n) { return String(n).padStart(2, '0'); }
 
+/**
+ * 格式化毫秒时间戳为东八区字符串
+ * fmt: 'HH:mm' | 'M/D HH:mm' | 'HH:mm:ss' | 默认 'YYYY-MM-DD HH:mm:ss'
+ */
 function fmtSH(tsMs, fmt) {
   const t = shTime(tsMs);
   if (fmt === 'HH:mm')     return `${_p2(t.h)}:${_p2(t.m)}`;
@@ -1376,18 +1353,22 @@ function fmtSH(tsMs, fmt) {
   return `${t.Y}-${_p2(t.Mo)}-${_p2(t.D)} ${_p2(t.h)}:${_p2(t.m)}:${_p2(t.s)}`;
 }
 
+// ==================== 主题切换（东八区 20:00-06:00 深色，其余浅色）====================
 function applyThemeByShanghaiTime() {
+  // ★ 修复 Bug1: 用 shTime 代替 toLocaleString
   const h = shTime(Date.now()).h;
   if (h >= 20 || h < 6) {
     document.documentElement.classList.remove('light');
   } else {
     document.documentElement.classList.add('light');
   }
+  // 主题切换后立即刷新 K 线颜色
   if (cBars && cBars.length) drawK(); else drawE();
 }
 applyThemeByShanghaiTime();
 setInterval(applyThemeByShanghaiTime, 60000);
 
+// ==================== 全局状态 ====================
 const $=id=>document.getElementById(id);
 const CP={
 forex:["EURUSD","GBPUSD","USDJPY","USDCHF","AUDUSD","USDCAD","NZDUSD","EURGBP","EURJPY","GBPJPY","AUDJPY","EURAUD","EURCHF","GBPCHF","CHFJPY","CADJPY","AUDNZD","AUDCAD","AUDCHF","EURNZD","EURCAD","CADCHF","NZDJPY","GBPAUD","GBPCAD","GBPNZD","NZDCAD","NZDCHF","USDSGD","USDHKD","USDCNH"],
@@ -1399,107 +1380,15 @@ stock:["AAPL","AMZN","BABA","GOOGL","META","MSFT","NFLX","NVDA","TSLA","ABBV","A
 const CN={forex:"外汇",metal:"贵金属",commodity:"大宗商品",index:"指数",crypto:"虚拟货币",stock:"股票"};
 let S="EURUSD",C="forex",TF="5min",lastM=null,stag=0,sigP=0;
 let cBars=[];
-let L=null;
+let L=null; // ★ 修复 Bug4: 正式声明全局变量，避免严格模式报错
 
+// ==================== K线视口状态 ====================
 let vStart=0;
 let vBars=60;
 const V_MIN=10, V_MAX=200;
+
+// 十字光标状态
 let crosshair={active:false,x:0,y:0,barIdx:-1};
-
-// ==================== ★ 修复5: SSE 连接管理 ====================
-let _sse = null;           // 当前 EventSource 实例
-let _sseReconnTimer = null;
-let _sseFailCount = 0;
-
-function startSSE() {
-  // 关闭旧连接
-  if (_sse) { try { _sse.close(); } catch(e){} _sse = null; }
-
-  const url = '/api/stream/quote?symbol=' + encodeURIComponent(S);
-  _sse = new EventSource(url);
-
-  _sse.onopen = function() {
-    cOk(true);
-    _sseFailCount = 0;
-    console.log('[SSE] connected for', S);
-  };
-
-  _sse.onmessage = function(ev) {
-    try {
-      const d = JSON.parse(ev.data);
-      cOk(true);
-      handleQuoteData(d);
-    } catch(e) {
-      console.error('[SSE] parse error', e);
-    }
-  };
-
-  _sse.onerror = function() {
-    cOk(false);
-    _sseFailCount++;
-    try { _sse.close(); } catch(e){}
-    _sse = null;
-    // 指数退避重连：1s, 2s, 4s, 最大 10s
-    const delay = Math.min(1000 * Math.pow(2, _sseFailCount - 1), 10000);
-    console.log('[SSE] error, reconnect in', delay, 'ms');
-    clearTimeout(_sseReconnTimer);
-    _sseReconnTimer = setTimeout(startSSE, delay);
-  };
-}
-
-function handleQuoteData(q) {
-  if (!q || !q.symbol) return;
-  const D = dg(S);
-  const b = Number(q.bid), a = Number(q.ask);
-  if (!Number.isFinite(b) || !Number.isFinite(a)) return;
-
-  const mid = (b + a) / 2, prev = lastM;
-  lastM = mid;
-  $('bP').innerText = fm(b, D);
-  $('aP').innerText = fm(a, D);
-  $('mP').innerText = fm(mid, D);
-  $('mP2').innerText = fm(mid, D);
-  $('bB').innerText = fm(b, D);
-  $('bA').innerText = fm(a, D);
-
-  const pe = $('mP');
-  pe.classList.remove('up', 'down');
-  if (prev != null) {
-    if (mid > prev) pe.classList.add('up');
-    else if (mid < prev) pe.classList.add('down');
-  }
-
-  const sp = q.spread != null ? q.spread : ((a - b) * Math.pow(10, D > 2 ? 0 : (5 - D))).toFixed(1);
-  $('sV').innerText = sp;
-  $('sT').innerText = '点差: ' + sp;
-
-  // 延迟信息
-  if (q.latency_ms != null && Number.isFinite(q.latency_ms)) {
-    const lat = Math.round(q.latency_ms);
-    if (Math.abs(lat) <= 600000) { $('lT').innerText = '延迟: ' + lat + 'ms'; lSig(lat); }
-    else { $('lT').innerText = '延迟: --'; lSig(99999); }
-  } else if (q.quote_time_shanghai) {
-    const t = q.quote_time_shanghai.split(' ')[1] || q.quote_time_shanghai;
-    $('lT').innerText = '更新: ' + t; lSig(99999);
-  } else {
-    $('lT').innerText = '延迟: --'; lSig(99999);
-  }
-
-  // 数据时间
-  if (q.quote_time_shanghai) {
-    $('uT').innerText = '数据: ' + q.quote_time_shanghai;
-  } else if (q.server_time_shanghai) {
-    $('uT').innerText = '数据: ' + q.server_time_shanghai;
-  } else if (q.received_at) {
-    const t = q.received_at.split(' ')[1] || q.received_at;
-    $('uT').innerText = '更新: ' + t;
-  } else {
-    $('uT').innerText = '数据: --';
-  }
-
-  // 重置停滞检测
-  stag = 0;
-}
 
 // ==================== 工具函数 ====================
 function dg(s){if(!s)return 2;const u=s.toUpperCase();
@@ -1514,6 +1403,7 @@ if(!fx.some(c=>u.includes(c)))return 2;
 return 5;}
 function fm(n,d){return n!=null?parseFloat(n).toFixed(d):'--'}
 
+// Y轴区间自适应算法
 function nS(lo,hi,mt){
 if(lo===hi){const d=lo===0?1:Math.abs(lo)*.01;lo-=d;hi+=d}
 const r=hi-lo,p=r*.08;let mn=lo-p,mx=hi+p;
@@ -1524,6 +1414,7 @@ const tI=Math.floor(mn/ns)*ns,tA=Math.ceil(mx/ns)*ns,tk=[];
 for(let v=tI;v<=tA+ns*.5;v+=ns)tk.push(v);
 return{tI:tI,tA:tA,ns:ns,tk:tk}}
 
+// ==================== 绘制引擎 ====================
 function drawK(){
 const cv=$('kc');if(!cv)return;
 const ctx=cv.getContext('2d');
@@ -1537,12 +1428,15 @@ if(!cBars||cBars.length===0){drawE();return}
 const PL=8,PR=76,PT=16,PB=32,cW=w-PL-PR,cH=h-PT-PB;
 if(cW<=0||cH<=0)return;
 
+// ★ 修复 Bug3: 根据主题动态选色，不再硬编码深色值
 const isLight = document.documentElement.classList.contains('light');
-const G  = isLight ? '#0ea571' : '#0ecb81';
-const R  = isLight ? '#e53935' : '#f6465d';
-const gr = isLight ? 'rgba(0,0,0,0.07)' : 'rgba(255,255,255,0.04)';
-const ax = isLight ? '#555555' : '#5e6673';
+const G  = isLight ? '#0ea571' : '#0ecb81';   // 阳线
+const R  = isLight ? '#e53935' : '#f6465d';   // 阴线
+const gr = isLight ? 'rgba(0,0,0,0.07)'       // 网格线（浅色主题可见）
+                   : 'rgba(255,255,255,0.04)'; // 网格线（深色主题）
+const ax = isLight ? '#555555' : '#5e6673';   // 轴标签
 
+// 计算当前视图
 const totalBars=cBars.length;
 const endIdx=Math.min(vStart+vBars,totalBars);
 const startIdxF=vStart;
@@ -1553,6 +1447,7 @@ if(visibleCount<=0){drawE();return}
 const vb=cBars.slice(Math.floor(startIdxF),Math.ceil(endIdxF));
 const n=vb.length;
 
+// Y轴自动缩放
 let dMin=Infinity,dMax=-Infinity;
 for(const b of vb){
   if(b[2]>dMax)dMax=b[2];
@@ -1562,14 +1457,17 @@ const D=dg(S),sc=nS(dMin,dMax,6);
 const yI=sc.tI,yA=sc.tA,yR=yA-yI||1;
 const p2y=p=>PT+cH*(1-(p-yI)/yR),y2p=y=>yI+(1-(y-PT)/cH)*yR;
 
+// X轴 bar 宽度
 const bT=cW/visibleCount;
 const gap=Math.max(1,Math.round(bT*.2));
 const bW=Math.max(1,Math.floor(bT-gap));
 const hB=bW/2;
 const bxAt=(idx)=>PL+(idx-startIdxF+0.5)*bT;
 
+// 更新全局布局缓存
 L={PL,PR,PT,PB,cW,cH,bT,vBars,startIdxF,endIdxF,yI,yA,yR,p2y,y2p,D,vb,totalBars};
 
+// 绘制网格 & Y轴标签
 ctx.font='11px "SF Mono",Menlo,monospace';
 ctx.textAlign='left';
 ctx.textBaseline='middle';
@@ -1581,6 +1479,7 @@ for(const t of sc.tk){
   ctx.fillStyle=ax;ctx.fillText(t.toFixed(D),PL+cW+6,y)
 }
 
+// 绘制烛台
 for(let i=0;i<n;i++){
   const b=vb[i];
   const barIdx=Math.floor(startIdxF)+i;
@@ -1594,6 +1493,7 @@ for(let i=0;i<n;i++){
   ctx.fillRect(Math.round(x-hB),Math.round(bt),Math.max(1,bW),Math.max(1,bh));
 }
 
+// 最新价虚线
 const lastBarIdx=Math.min(Math.floor(endIdxF)-1,totalBars-1);
 if(lastBarIdx>=0){
   const lastBar=cBars[lastBarIdx];
@@ -1606,6 +1506,8 @@ if(lastBarIdx>=0){
   ctx.fillText(lc.toFixed(D),tX+tW/2,Math.round(yL));
 }
 
+// X轴标签
+// ★ 修复 Bug1: 用 fmtSH 代替 toLocaleString，Safari/iOS 稳定显示
 ctx.fillStyle=ax;ctx.font='10px "SF Mono",Menlo,monospace';ctx.textAlign='center';ctx.textBaseline='top';
 const mG=60,iMs=TF==='1hour'?3600000*4:TF==='10min'?3600000:1800000;
 let lX=-Infinity;
@@ -1621,12 +1523,14 @@ for(let i=0;i<visibleCount;i++){
   ctx.fillStyle=ax;ctx.fillText(lb,x,PT+cH+6);lX=x;
 }
 
+// 拖拽时滚动条
 if(isDragging){
   const pct=(vStart/(totalBars-vBars))*100;
   const barPct=vBars/totalBars*100;
   drawScrollBar(pct,barPct);
 }
 
+// 十字光标
 drawCrosshair();
 }
 
@@ -1647,6 +1551,7 @@ function drawE(){
 const cv=$('kc');if(!cv)return;
 const ctx=cv.getContext('2d'),dpr=devicePixelRatio||1,w=cv.offsetWidth,h=cv.offsetHeight;
 cv.width=w*dpr;cv.height=h*dpr;ctx.scale(dpr,dpr);ctx.clearRect(0,0,w,h);
+// ★ 修复 Bug3: 空状态文字颜色适配主题
 const isLight = document.documentElement.classList.contains('light');
 ctx.fillStyle = isLight ? '#888888' : '#5e6673';
 ctx.font='13px sans-serif';ctx.textAlign='center';ctx.textBaseline='middle';
@@ -1654,6 +1559,7 @@ ctx.fillText('暂无 K 线数据',w/2,h/2);
 L=null;crosshair={active:false,x:0,y:0,barIdx:-1};
 }
 
+// ==================== 十字光标 ====================
 function drawCrosshair(){
 const cv=$('cc');if(!cv)return;
 const dpr=devicePixelRatio||1,w=cv.offsetWidth,h=cv.offsetHeight;
@@ -1662,6 +1568,7 @@ if(!crosshair.active||!L){cv.getContext('2d').clearRect(0,0,w,h);return}
 const ctx=cv.getContext('2d');
 ctx.clearRect(0,0,w,h);
 
+// ★ 修复 Bug3: 十字光标颜色适配主题
 const isLight = document.documentElement.classList.contains('light');
 const chCross = isLight ? 'rgba(0,0,0,0.2)'   : 'rgba(255,255,255,0.25)';
 const chBg    = isLight ? '#c8cdd6'            : '#2b3139';
@@ -1672,11 +1579,13 @@ const cx=Math.max(PL,Math.min(crosshair.x,PL+cW)),cy=Math.max(PT,Math.min(crossh
 const fracIdx=startIdxF+(cx-PL)/bT;
 const idx=Math.max(0,Math.min(Math.floor(fracIdx),totalBars-1));
 
+// 十字线
 ctx.setLineDash([3,3]);ctx.strokeStyle=chCross;ctx.lineWidth=1;
 ctx.beginPath();ctx.moveTo(Math.round(cx)+.5,PT);ctx.lineTo(Math.round(cx)+.5,PT+cH);ctx.stroke();
 ctx.beginPath();ctx.moveTo(PL,Math.round(cy)+.5);ctx.lineTo(PL+cW,Math.round(cy)+.5);ctx.stroke();
 ctx.setLineDash([]);
 
+// Y轴价格标签
 const pr=L.y2p(cy);
 const tW2=64,tH2=18,tX2=PL+cW+2,tY2=Math.round(cy)-tH2/2;
 ctx.fillStyle=chBg;
@@ -1686,6 +1595,7 @@ ctx.fillText(pr.toFixed(D),tX2+tW2/2,Math.round(cy));
 
 if(idx>=0&&idx<totalBars){
   const b=cBars[idx],ts=b[0];
+  // ★ 修复 Bug1: 用 fmtSH 代替 toLocaleString
   const lb = TF==='1hour' ? fmtSH(ts,'M/D HH:mm') : fmtSH(ts,'HH:mm');
   const x=bxAtGlobal(idx);
   const tw=ctx.measureText(lb).width+12,tx=Math.round(x)-tw/2,ty=PT+cH+2;
@@ -1705,6 +1615,7 @@ if(!L)return 0;
 return L.PL+(idx-L.startIdxF+0.5)*L.bT;
 }
 
+// ==================== 拖拽平移 ====================
 let isDragging=false,lastDragX=0;
 
 function onDragStart(x){
@@ -1725,6 +1636,7 @@ function onDragEnd(){
 isDragging=false;drawK();
 }
 
+// ==================== 缩放 ====================
 function onWheel(e){
 e.preventDefault();
 if(!L||cBars.length===0)return;
@@ -1774,6 +1686,7 @@ if(newVBars!==vBars){
   lastPinchDist=dist;
 }}
 
+// ==================== 交互绑定 ====================
 (function(){
 const wr=$('cW');if(!wr)return;
 const cc=$('cc');if(cc){cc.style.pointerEvents='none';}
@@ -1805,7 +1718,9 @@ wr.addEventListener('touchend',e=>{
 },{passive:false});
 })();
 
+// ==================== 业务逻辑 ====================
 function tick(){
+  // ★ 修复 Bug1: 用 fmtSH 代替 toLocaleString，跨浏览器稳定
   $('clk').innerText = fmtSH(Date.now(), 'HH:mm:ss');
 }
 function stab(b,c){document.querySelectorAll('.tab').forEach(t=>t.classList.remove('on'));b.classList.add('on');C=c}
@@ -1817,60 +1732,48 @@ function pick(s){
   $('sN').innerText=s;$('msk').style.display='none';
   ['bP','aP','mP','mP2','sV','bB','bA'].forEach(id=>{if($(id))$(id).innerText='--'});
   $('sT').innerText='点差: --';lastM=null;stag=0;
-  drawE();fK();
+  drawE();rf();fK();
   vStart=0;vBars=60;
 }
 function detectCategoryBySymbol(sym){
 for(const[c,arr]of Object.entries(CP)){if(arr.includes(sym))return c}
 return'forex'}
 
-// ★ 核心修复: rf() 每 2 秒轮询报价，用 AbortController 防止请求 hang
-async function rf(){
-  try{
-    const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), 5000);
-    const r = await fetch('/api/latest_status?symbol='+encodeURIComponent(S), {signal: ctrl.signal});
-    clearTimeout(timer);
-    if(!r.ok){ cOk(false); return; }
-    const d = await r.json();
-    cOk(true);
-    if(d.latest_quote){
-      const q = d.latest_quote, D = dg(S);
-      const b = Number(q.bid), a = Number(q.ask);
-      if(Number.isFinite(b)&&Number.isFinite(a)){
-        const mid = (b+a)/2, prev = lastM; lastM = mid;
-        $('bP').innerText = fm(b,D); $('aP').innerText = fm(a,D);
-        $('mP').innerText = fm(mid,D); $('mP2').innerText = fm(mid,D);
-        $('bB').innerText = fm(b,D); $('bA').innerText = fm(a,D);
-        const pe = $('mP'); pe.classList.remove('up','down');
-        if(prev!=null){ if(mid>prev)pe.classList.add('up'); else if(mid<prev)pe.classList.add('down'); }
-        const sp = q.spread!=null?q.spread:((a-b)*Math.pow(10,D>2?0:(5-D))).toFixed(1);
-        $('sV').innerText = sp; $('sT').innerText='点差: '+sp;
-      }
-      if(q.latency_ms!=null&&Number.isFinite(q.latency_ms)){
-        const lat=Math.round(q.latency_ms);
-        if(Math.abs(lat)<=600000){$('lT').innerText='延迟: '+lat+'ms';lSig(lat)}
-        else{$('lT').innerText='延迟: --';lSig(99999)}
-      }else if(q.quote_time_shanghai){
-        const t=q.quote_time_shanghai.split(' ')[1]||q.quote_time_shanghai;
-        $('lT').innerText='更新: '+t;lSig(99999);
-      }else{$('lT').innerText='延迟: --';lSig(99999);}
-      if(q.quote_time_shanghai){ $('uT').innerText='数据: '+q.quote_time_shanghai; }
-      else if(q.server_time_shanghai){ $('uT').innerText='数据: '+q.server_time_shanghai; }
-      else if(q.received_at){ const t=q.received_at.split(' ')[1]||q.received_at; $('uT').innerText='更新: '+t; }
-      else{$('uT').innerText='数据: --';}
-    }else{
-      // 服务器可达但无数据
-      $('cT').innerText='已连接(无数据)';
-      $('uT').innerText='等待 MT4 推送...';
-    }
-  }catch(e){
-    console.error('[rf]', e.name||e, e.message||'');
-    cOk(false);
-    if(e.name==='AbortError') $('cT').innerText='请求超时';
-    else $('cT').innerText='连接失败: '+(e.message||'');
-  }
+async function rf(){try{
+const r=await fetch('/api/latest_status?symbol='+encodeURIComponent(S)),d=await r.json();
+cOk(true);
+if(d.latest_quote){const q=d.latest_quote,D=dg(S);
+const b=Number(q.bid),a=Number(q.ask);
+if(Number.isFinite(b)&&Number.isFinite(a)){
+const mid=(b+a)/2,prev=lastM;lastM=mid;
+$('bP').innerText=fm(b,D);$('aP').innerText=fm(a,D);
+$('mP').innerText=fm(mid,D);$('mP2').innerText=fm(mid,D);
+$('bB').innerText=fm(b,D);$('bA').innerText=fm(a,D);
+const pe=$('mP');pe.classList.remove('up','down');
+if(prev!=null){if(mid>prev)pe.classList.add('up');else if(mid<prev)pe.classList.add('down')}
+const sp=q.spread!=null?q.spread:((a-b)*Math.pow(10,D>2?0:(5-D))).toFixed(1);
+$('sV').innerText=sp;$('sT').innerText='点差: '+sp}
+if(q.latency_ms!=null&&Number.isFinite(q.latency_ms)){
+  const lat=Math.round(q.latency_ms);
+  if(Math.abs(lat)<=600000){$('lT').innerText='延迟: '+lat+'ms';lSig(lat)}
+  else{$('lT').innerText='延迟: --';lSig(99999)}
+}else if(q.quote_time_shanghai){
+  const t=q.quote_time_shanghai.split(' ')[1]||q.quote_time_shanghai;
+  $('lT').innerText='更新: '+t;lSig(99999);
+}else{
+  $('lT').innerText='延迟: --';lSig(99999);
 }
+if(q.quote_time_shanghai){
+  $('uT').innerText='数据: '+q.quote_time_shanghai;
+}else if(q.server_time_shanghai){
+  $('uT').innerText='数据: '+q.server_time_shanghai;
+}else if(q.received_at){
+  const t=q.received_at.split(' ')[1]||q.received_at;
+  $('uT').innerText='更新: '+t;
+}else{
+  $('uT').innerText='数据: --';
+}
+}}catch(e){console.error(e);cOk(false)}}
 
 async function fK(){
 try{
@@ -1896,6 +1799,7 @@ function chkS(){const p=parseFloat($('mP')?.innerText)||0;
 if(sigP===p&&p>0){stag++;if(stag>=5){const s=$('lS');if(s){s.className='sg';s.classList.add('r')}$('lT').innerText='数据停滞!'}}
 else stag=0;sigP=p}
 
+// K线实时刷新（追加新 bar，跟随最新）
 let lastKlineLen=0;
 setInterval(async()=>{
 try{
@@ -1915,11 +1819,10 @@ drawK();
 },2000);
 
 setInterval(chkS,2000);
+// ★ 修复 Bug1: tick() 使用 fmtSH，Safari 上不再显示 NaN:NaN:NaN
 tick();setInterval(tick,1000);
 addEventListener('resize',()=>{clearTimeout(window._rt);window._rt=setTimeout(()=>{if(cBars.length)drawK();else drawE()},100)});
-
 rf();fK();
-setInterval(rf, 2000);
 </script>
 </body></html>
 """
@@ -1928,12 +1831,7 @@ setInterval(rf, 2000);
 def index():
     return render_template_string(HTML_TEMPLATE)
 
-@app.route("/api/ping", methods=["GET"])
-def api_ping():
-    """最简连通性测试"""
-    return jsonify({"pong": True, "time": now_shanghai_str()})
-
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     debug_mode = os.environ.get("FLASK_DEBUG", "0") == "1"
-    app.run(host="0.0.0.0", port=port, debug=debug_mode, threaded=True)
+    app.run(host="0.0.0.0", port=port, debug=debug_mode)
