@@ -71,6 +71,7 @@ def init_db():
         conn = get_conn()
         print(f"[DB] connecting to {MYSQL_HOST}:{MYSQL_PORT} as {MYSQL_USER} / db={MYSQL_DB}")
         with conn.cursor() as cur:
+            # 原有 tick_logs 表
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS tick_logs (
                     id BIGINT AUTO_INCREMENT PRIMARY KEY,
@@ -83,6 +84,7 @@ def init_db():
                     INDEX idx_time (tick_time)
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
             """)
+            # ---- 新增：简化报价历史表（5字段模板）----
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS quote_ticks (
                     id BIGINT AUTO_INCREMENT PRIMARY KEY,
@@ -95,6 +97,7 @@ def init_db():
                     INDEX idx_received_at (received_at)
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
             """)
+            # ---- 新增：最新报价快照表（每个 symbol 只保留一条）----
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS latest_quotes (
                     symbol VARCHAR(20) PRIMARY KEY,
@@ -139,6 +142,12 @@ def _flush_buf():
     threading.Thread(target=_do_insert, args=(batch,), daemon=True).start()
 
 def _do_insert(batch, retry_count=0):
+    """
+    批量写入 quote_ticks + upsert latest_quotes。
+    输入 batch 是 list[dict]，每个 dict 包含：
+    symbol, bid, ask, spread, received_at, _retry_count(可选)
+    失败时会回灌一次，retry_count>=2 时不再回灌。
+    """
     global _db_ok
     if not batch:
         return
@@ -161,6 +170,7 @@ def _do_insert(batch, retry_count=0):
     except Exception as e:
         _db_ok = False
         print(f"[DB] _do_insert failed ({len(batch)}): {repr(e)}")
+        # 失败时回灌一次，最多重试一次
         if retry_count < 1:
             print(f"[DB] batch requeued (retry {retry_count + 1})")
             def requeue():
@@ -190,27 +200,35 @@ MAX_HISTORY = 50
 KLINE_MAX = {"5min": 300, "10min": 250, "1hour": 200}
 kline_data = {}
 kline_locks = {}
-kline_locks_guard = threading.Lock()
+kline_locks_guard = threading.Lock()  # 保护 kline_locks 创建
 
+# ==================== 品种名归一化（核心修复） ====================
 KNOWN_SYMBOLS = set()
 
 def get_kline_lock(symbol):
+    """获取 symbol 对应的锁，线程安全"""
     if symbol not in kline_locks:
         with kline_locks_guard:
-            if symbol not in kline_locks:
+            if symbol not in kline_locks:  # 双重检查
                 kline_locks[symbol] = threading.Lock()
     return kline_locks[symbol]
 
 def normalize_symbol(raw_symbol: str) -> str:
+    """
+    将 MT4 原始品种名归一化为标准名。
+    MT4 经纪商经常给品种加后缀: EURUSDm, XAUUSD.a, NASUSDc, U30USD.r 等
+    """
     if not raw_symbol:
         return ""
     s = raw_symbol.strip().upper()
     if s in KNOWN_SYMBOLS:
         return s
+    # 去掉末尾 1~4 字符尝试匹配
     for trim in range(1, 5):
         candidate = s[:-trim] if len(s) > trim else ""
         if candidate and candidate in KNOWN_SYMBOLS:
             return candidate
+    # 去掉点号后缀
     if '.' in s:
         candidate = s.split('.')[0]
         if candidate in KNOWN_SYMBOLS:
@@ -229,6 +247,7 @@ def _floor_ts(ts_ms, tf):
     return (ts_ms // step) * step
 
 def update_kline(symbol, bid, ask, tick_ts_ms):
+    """bar 格式: [ts, open, high, low, close]  索引: 0, 1, 2, 3, 4"""
     mid = (bid + ask) / 2.0
     norm = normalize_symbol(symbol)
     tfs = ["5min", "10min", "1hour"]
@@ -240,9 +259,10 @@ def update_kline(symbol, bid, ask, tick_ts_ms):
             bars = kline_data[norm][tf]
             if bars and bars[-1][0] == bar_ts:
                 bar = bars[-1]
-                bar[2] = max(bar[2], mid)
-                bar[3] = min(bar[3], mid)
-                bar[4] = mid
+                # ★ 修复: open(bar[1])不动, 只更新 high/low/close
+                bar[2] = max(bar[2], mid)   # high
+                bar[3] = min(bar[3], mid)   # low
+                bar[4] = mid                # close
             else:
                 bars.append([bar_ts, mid, mid, mid, mid])
                 if len(bars) > KLINE_MAX[tf]:
@@ -255,6 +275,7 @@ history_poll = deque(maxlen=MAX_HISTORY)
 history_echo = deque(maxlen=MAX_HISTORY)
 history_lock = threading.RLock()
 
+# 与 K 线同源：最后一笔报价按归一化品种缓存，避免仅依赖 history 扫描或 JSON 形态差异导致页面不同步
 latest_quote_cache = {}
 quote_cache_lock = threading.Lock()
 
@@ -268,6 +289,13 @@ def _to_float(v):
 
 # ==================== 5字段报价模板 ====================
 def make_quote_row(raw_symbol, bid, ask, spread=None):
+    """
+    生成统一5字段报价模板 dict。
+    - 自动归一化 symbol
+    - 对 bid/ask/spread 做安全 float 转换
+    - received_at 使用东八区时间字符串
+    - 无效数据返回 None
+    """
     norm = normalize_symbol(raw_symbol or "")
     if not norm:
         return None
@@ -287,12 +315,14 @@ def make_quote_row(raw_symbol, bid, ask, spread=None):
     }
 
 # ==================== 时间戳工具 ====================
+# 上游行情时间偏移配置（小时），用于修正 broker 本地时间与 UTC 的差值
 SOURCE_TS_OFFSET_HOURS = int(os.environ.get("SOURCE_TS_OFFSET_HOURS", "0"))
 SOURCE_TS_OFFSET_MS = SOURCE_TS_OFFSET_HOURS * 3600 * 1000
 
 def to_tick_ts_ms(ts_value, apply_source_offset=True):
     """
-    将任意形式的时间值统一转换为毫秒时间戳（UTC）。
+    将任意形式的时间值统一转换为毫秒时间戳。
+    支持：None、秒级 int/float、毫秒级 int/float、字符串数字。
     大于 1e12 视为毫秒，否则视为秒。
     如果 apply_source_offset=True 且配置了偏移，则减去 SOURCE_TS_OFFSET_MS。
     """
@@ -308,6 +338,7 @@ def to_tick_ts_ms(ts_value, apply_source_offset=True):
     return result
 
 def ts_ms_to_shanghai_str(ts_ms):
+    """毫秒时间戳 → 东八区字符串（精确到毫秒）"""
     if ts_ms is None:
         return ""
     try:
@@ -317,10 +348,19 @@ def ts_ms_to_shanghai_str(ts_ms):
         return ""
 
 def ts_ms_to_db_str(ts_ms):
+    """
+    毫秒时间戳 → 东八区数据库查询字符串（精确到毫秒）。
+    专用于 /api/quote-hist 的 SQL 字符串时间比较。
+    """
     return ts_ms_to_shanghai_str(ts_ms)
 
 def build_latency_fields(ts_value):
-    quote_ts_ms = to_tick_ts_ms(ts_value)
+    """
+    给定行情原始 ts，生成时差比对信息。
+    返回：quote_ts_ms, quote_time_shanghai, server_ts_ms,
+          server_time_shanghai, latency_ms, is_stale
+    """
+    quote_ts_ms = to_tick_ts_ms(ts_value)  # 自动应用 SOURCE_TS_OFFSET_MS
     now_dt = now_shanghai_dt()
     server_ts_ms = int(now_dt.timestamp() * 1000)
     server_time_shanghai = now_shanghai_str()
@@ -340,6 +380,13 @@ def build_latency_fields(ts_value):
     }
 
 def build_live_quote_payload(q):
+    """
+    把 latest_quote_cache 中的一条记录 q，组装成带时差的完整行情 payload。
+    返回 None（无效）或 dict：
+      symbol, bid, ask, spread, received_at, quote_ts_ms,
+      quote_time_shanghai, server_ts_ms, server_time_shanghai,
+      latency_ms, is_stale
+    """
     if not isinstance(q, dict):
         return None
     sym = q.get("symbol")
@@ -368,6 +415,7 @@ def _bid_ask_from_dict(d):
     return None, None
 
 def _message_to_quote_dict(p):
+    """message 可能是 JSON 字符串或已是 dict"""
     m = p.get("message")
     if m is None:
         return None
@@ -400,6 +448,7 @@ def cache_tick_quote(raw_symbol, bid, ask, spread=None, ts=None):
         latest_quote_cache[norm] = rec
 
 def ingest_quote_from_parsed(p):
+    """从 MT4 report 解析对象尽量提取 bid/ask 并写入缓存"""
     if not isinstance(p, dict):
         return
     rs = p.get("symbol") or p.get("Symbol") or ""
@@ -417,7 +466,7 @@ def ingest_quote_from_parsed(p):
     ts = p.get("ts") or p.get("time") or p.get("Time")
     cache_tick_quote(rs, b, a, spread=sp, ts=ts)
 
-# ==================== 产品规则表 ====================
+# ==================== 产品规则表（完整版） ====================
 PRODUCT_SPECS = {
     "USDCHF":{"size":100000,"lev":500,"currency":"CHF","type":"forex"},
     "GBPUSD":{"size":100000,"lev":500,"currency":"USD","type":"forex"},
@@ -544,6 +593,7 @@ def detect_category(path, parsed_json):
     return "other"
 
 def _symbol_matches(record_symbol_raw, filter_symbol):
+    """模糊匹配: EURUSDm -> EURUSD"""
     if not filter_symbol: return True
     if not record_symbol_raw: return False
     return normalize_symbol(record_symbol_raw) == filter_symbol
@@ -571,6 +621,7 @@ def store_mt4_data(raw_body, client_ip, headers_dict):
 # ==================== 调试接口 ====================
 @app.route("/api/debug/symbols", methods=["GET"])
 def api_debug_symbols():
+    """查看 MT4 推送的原始品种名 vs 归一化后的名字，调试匹配问题"""
     raw_syms = {}
     with history_lock:
         for r in history_report:
@@ -650,6 +701,7 @@ def api_latest_status():
             detail = {"received_at":pr.get("received_at"),"account":pd.get("account"),"server":pd.get("server"),
                 "positions":pd.get("positions") or []}
 
+    # 补充时差字段
     if latest_quote and isinstance(latest_quote, dict):
         latest_quote.update(build_latency_fields(latest_quote.get("ts")))
 
@@ -699,13 +751,13 @@ def _handle_tick_list(ticks):
         bf, af = _to_float(bid), _to_float(ask)
         if bf is None or af is None:
             continue
-
-        # ★ 修复 Bug2：统一走 to_tick_ts_ms() 以正确应用 SOURCE_TS_OFFSET_MS
-        ts_ms = to_tick_ts_ms(tt)
-        if ts_ms is None:
+        if tt is not None:
+            tft = float(tt)
+            ts_ms = int(tft) if tft > 1e12 else int(tft * 1000)
+        else:
             ts_ms = int(time.time() * 1000)
-
         spread = _to_float(tick.get('spread')) or 0
+        norm = normalize_symbol(sym_raw)
 
         # 1) memory: kline + quote cache
         update_kline(sym_raw, bf, af, ts_ms)
@@ -723,7 +775,7 @@ def _handle_tick_list(ticks):
         with history_lock:
             history_report.appendleft(record)
 
-        # 3) MySQL buffer
+        # 3) MySQL buffer（5字段模板 dict）
         quote_row = make_quote_row(sym_raw, bid, ask, spread=spread)
         if quote_row:
             _buf_append(quote_row)
@@ -759,14 +811,14 @@ def tick_ren():
 
 @app.route('/api/tick-hist', methods=['POST'])
 def tick_hist():
-    """Historical batch import"""
+    """Historical batch import: 写旧 tick_logs + 新 quote_ticks + upsert latest_quotes"""
     if not HAS_MYSQL:
         return jsonify({"ok": False, "error": "MySQL not available"}), 503
     try:
         ticks = request.json
         if not isinstance(ticks, list): ticks = [ticks]
-        old_rows = []
-        new_rows = []
+        old_rows = []   # tick_logs 格式（保持兼容）
+        new_rows = []   # quote_ticks / latest_quotes 格式
         for tick in ticks:
             sym_raw = tick.get('symbol')
             bid, ask = tick.get('bid'), tick.get('ask')
@@ -775,12 +827,11 @@ def tick_hist():
             bf, af = _to_float(bid), _to_float(ask)
             if bf is None or af is None: continue
             spread = _to_float(tick.get('spread')) or 0
-
-            # ★ 修复 Bug2：统一走 to_tick_ts_ms()
-            ts_ms = to_tick_ts_ms(tt)
-            if ts_ms is None:
+            if tt is not None:
+                tft = float(tt)
+                ts_ms = int(tft) if tft > 1e12 else int(tft * 1000)
+            else:
                 ts_ms = int(time.time() * 1000)
-
             mid = (bf + af) / 2.0
             norm = normalize_symbol(sym_raw)
             now_str = now_shanghai_str()
@@ -819,6 +870,7 @@ def _parse_ts(val):
         return v if v > 1e12 else v * 1000
     for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
         try:
+            # 使用东八区解析字符串时间
             dt = datetime.strptime(val, fmt).replace(tzinfo=SH_TZ)
             return int(dt.timestamp() * 1000)
         except ValueError:
@@ -834,9 +886,10 @@ def api_hist():
     norm = normalize_symbol(symbol)
     limit = min(int(request.args.get("limit", 1000)), 10000)
     agg = request.args.get("agg", "raw")
+    # 使用东八区当前时间计算默认时间范围
     now_sh = now_shanghai_dt()
-    default_from = int(now_sh.timestamp() * 1000) - 3600000
-    default_to = int(now_sh.timestamp() * 1000) + 60000
+    default_from = int(now_sh.timestamp() * 1000) - 3600000  # 1小时前
+    default_to = int(now_sh.timestamp() * 1000) + 60000       # 1分钟后
     from_ts = _parse_ts(request.args.get("from")) or default_from
     to_ts = _parse_ts(request.args.get("to")) or default_to
     try:
@@ -903,9 +956,11 @@ def api_debug_db():
     except Exception as e:
         return jsonify({"db_ok":False,"error":str(e)})
 
-# ==================== 实时内存报价接口 ====================
+# ==================== 实时内存报价接口（极速） ====================
+
 @app.route("/api/quote-live", methods=["GET"])
 def api_quote_live():
+    """从内存 latest_quote_cache 读取指定 symbol 的实时报价（含时差）"""
     symbol = request.args.get("symbol", "").strip()
     if not symbol:
         return jsonify({"error": "symbol required"}), 400
@@ -923,6 +978,7 @@ def api_quote_live():
 
 @app.route("/api/quotes-live", methods=["GET"])
 def api_quotes_live():
+    """从内存 latest_quote_cache 读取全市场实时报价快照（含时差）"""
     with quote_cache_lock:
         cache_items = list(latest_quote_cache.items())
     server_time = now_shanghai_str()
@@ -932,11 +988,17 @@ def api_quotes_live():
         if p:
             data.append(p)
     data.sort(key=lambda x: x["symbol"])
-    return jsonify({"count": len(data), "server_time_shanghai": server_time, "data": data})
+    return jsonify({
+        "count": len(data),
+        "server_time_shanghai": server_time,
+        "data": data,
+    })
 
-# ==================== 数据库报价接口 ====================
+# ==================== 数据库报价接口（含时差信息） ====================
+
 @app.route("/api/quote", methods=["GET"])
 def api_quote():
+    """查询指定 symbol 的最新报价（从 latest_quotes 表），补充服务端时间"""
     symbol = request.args.get("symbol", "").strip()
     if not symbol:
         return jsonify({"error": "symbol required"}), 400
@@ -961,15 +1023,21 @@ def api_quote():
                   "spread": row["spread"],
                   "received_at": (row["received_at"].strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
                                   if hasattr(row["received_at"], "strftime") else str(row["received_at"] or "")),
-                  "quote_ts_ms": None, "quote_time_shanghai": "",
-                  "server_ts_ms": server_ts, "server_time_shanghai": server_time,
-                  "latency_ms": None, "is_stale": None}
+                  # 表中没有原始 ts，无法计算真正延迟，标注为 None
+                  "quote_ts_ms": None,
+                  "quote_time_shanghai": "",
+                  "server_ts_ms": server_ts,
+                  "server_time_shanghai": server_time,
+                  "latency_ms": None,
+                  "is_stale": None,
+                  }
         return jsonify(result)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 @app.route("/api/quotes", methods=["GET"])
 def api_quotes():
+    """返回所有产品的最新报价快照（从 latest_quotes 表），补充服务端时间"""
     if not HAS_MYSQL:
         return jsonify({"error": "MySQL not available"}), 503
     server_time = now_shanghai_str()
@@ -986,9 +1054,13 @@ def api_quotes():
                     "spread": r["spread"],
                     "received_at": (r["received_at"].strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
                                     if hasattr(r["received_at"], "strftime") else str(r.get("received_at") or "")),
-                    "quote_ts_ms": None, "quote_time_shanghai": "",
-                    "server_ts_ms": server_ts, "server_time_shanghai": server_time,
-                    "latency_ms": None, "is_stale": None}
+                    "quote_ts_ms": None,
+                    "quote_time_shanghai": "",
+                    "server_ts_ms": server_ts,
+                    "server_time_shanghai": server_time,
+                    "latency_ms": None,
+                    "is_stale": None,
+                    }
             formatted.append(item)
         return jsonify({"count": len(formatted), "server_time_shanghai": server_time, "data": formatted})
     except Exception as e:
@@ -996,6 +1068,7 @@ def api_quotes():
 
 @app.route("/api/quote-hist", methods=["GET"])
 def api_quote_hist():
+    """查询 quote_ticks 历史，只返回 5 字段（不含时差，表内无 ts）"""
     if not HAS_MYSQL or not _db_ok:
         return jsonify({"error": "MySQL not available"}), 503
     symbol = request.args.get("symbol", "").strip()
@@ -1003,11 +1076,13 @@ def api_quote_hist():
         return jsonify({"error": "symbol required"}), 400
     norm = normalize_symbol(symbol)
     limit = min(int(request.args.get("limit", 100)), 5000)
+    # 使用东八区当前时间计算默认时间范围
     now_sh = now_shanghai_dt()
-    default_from = int(now_sh.timestamp() * 1000) - 3600000
-    default_to = int(now_sh.timestamp() * 1000) + 60000
+    default_from = int(now_sh.timestamp() * 1000) - 3600000  # 1小时前
+    default_to = int(now_sh.timestamp() * 1000) + 60000       # 1分钟后
     from_ts = _parse_ts(request.args.get("from")) or default_from
     to_ts = _parse_ts(request.args.get("to")) or default_to
+    # 转为东八区字符串，避免 MySQL FROM_UNIXTIME 时区依赖
     from_str = ts_ms_to_db_str(from_ts)
     to_str = ts_ms_to_db_str(to_ts)
     try:
@@ -1035,12 +1110,14 @@ def api_quote_hist():
 
 @app.route("/api/debug/quotes-db", methods=["GET"])
 def api_debug_quotes_db():
+    """调试接口：查看新报价表的统计信息，含服务端时间"""
     now_s = now_shanghai_str()
     now_ms = int(now_shanghai_dt().timestamp() * 1000)
     if not HAS_MYSQL:
         with _buf_lock: bs = len(_write_buf)
         return jsonify({"db_ok": False, "has_mysql": False,
-                        "buffer_pending": bs, "server_time_shanghai": now_s, "server_ts_ms": now_ms})
+                        "buffer_pending": bs,
+                        "server_time_shanghai": now_s, "server_ts_ms": now_ms})
     try:
         conn = get_conn()
         with conn.cursor() as cur:
@@ -1050,16 +1127,26 @@ def api_debug_quotes_db():
             qt_cnt = cur.fetchone()["cnt"]
         conn.close()
         with _buf_lock: bs = len(_write_buf)
-        return jsonify({"db_ok": _db_ok, "latest_quotes_count": lq_cnt,
-                        "quote_ticks_count": qt_cnt, "buffer_pending": bs,
-                        "server_time_shanghai": now_s, "server_ts_ms": now_ms})
+        return jsonify({
+            "db_ok": _db_ok,
+            "latest_quotes_count": lq_cnt,
+            "quote_ticks_count": qt_cnt,
+            "buffer_pending": bs,
+            "server_time_shanghai": now_s,
+            "server_ts_ms": now_ms,
+        })
     except Exception as e:
         return jsonify({"db_ok": False, "error": str(e),
                         "server_time_shanghai": now_s, "server_ts_ms": now_ms})
 
 # ==================== SSE 持续监听接口 ====================
+
 @app.route("/api/stream/quote", methods=["GET"])
 def stream_quote():
+    """
+    SSE 持续推送指定 symbol 的实时报价（内存）。
+    注意：该接口适合少量客户端，高频大量客户端不建议直接使用。
+    """
     from flask import Response
     symbol = request.args.get("symbol", "").strip()
     if not symbol:
@@ -1085,12 +1172,13 @@ def stream_quote():
                             last_payload_str = s
                             heartbeat_counter = 0
                             yield f"data: {s}\n\n"
+                # 每 15 次循环（约 3 秒）发送一次心跳
                 heartbeat_counter += 1
                 if heartbeat_counter % 15 == 0:
                     yield ": ping\n\n"
                 time.sleep(0.2)
         except GeneratorExit:
-            pass
+            pass  # 客户端断开
         except Exception as e:
             print(f"[SSE] stream_quote error: {repr(e)}")
 
@@ -1099,7 +1187,15 @@ def stream_quote():
 
 @app.route("/api/stream/quotes", methods=["GET"])
 def stream_quotes():
+    """
+    SSE 持续推送全市场实时报价快照（内存）。
+    支持参数：
+    - limit: 只推送前 N 个 symbol（默认全部）
+    - symbols: 逗号分隔的 symbol 列表，只监听指定品种
+    注意：该接口适合少量客户端，高频大量客户端不建议直接使用。
+    """
     from flask import Response
+    # 可选参数：只推前 N 个，或只推指定品种
     limit_str = request.args.get("limit", "")
     limit_n = int(limit_str) if limit_str.isdigit() else None
     symbols_str = request.args.get("symbols", "")
@@ -1117,12 +1213,14 @@ def stream_quotes():
                 server_time = now_shanghai_str()
                 data = []
                 for sym, q in items:
+                    # 过滤 symbol
                     if symbols_filter and sym not in symbols_filter:
                         continue
                     p = build_live_quote_payload(dict(q))
                     if p:
                         data.append(p)
                 data.sort(key=lambda x: x["symbol"])
+                # 限制数量
                 if limit_n:
                     data = data[:limit_n]
                 payload = {"count": len(data), "server_time_shanghai": server_time, "data": data}
@@ -1131,12 +1229,13 @@ def stream_quotes():
                     last_payload_str = s
                     heartbeat_counter = 0
                     yield f"data: {s}\n\n"
+                # 每 30 次循环（约 15 秒）发送一次心跳
                 heartbeat_counter += 1
                 if heartbeat_counter % 30 == 0:
                     yield ": ping\n\n"
                 time.sleep(0.5)
         except GeneratorExit:
-            pass
+            pass  # 客户端断开
         except Exception as e:
             print(f"[SSE] stream_quotes error: {repr(e)}")
 
@@ -1150,6 +1249,7 @@ def api_health():
     with _buf_lock: bs=len(_write_buf)
     now_s = now_shanghai_str()
     now_ms = int(now_shanghai_dt().timestamp() * 1000)
+    # 距上次 flush 的毫秒数
     flush_age_ms = int((time.time() - _last_flush) * 1000)
     return jsonify({"status":"ok","ticks_received":cnt,"last_tick_at":last,
         "symbols_cached":len(syms),"symbols":syms[:20],"db_ok":_db_ok,"has_mysql":HAS_MYSQL,
@@ -1184,8 +1284,13 @@ HTML_TEMPLATE = r"""<!doctype html>
 :root{--bg:#0b0e11;--card:#161a1e;--card2:#1e2329;--text:#eaecef;--muted:#5e6673;
 --line:#2b3139;--green:#0ecb81;--red:#f6465d;--yellow:#f0b90b;--accent:#f0b90b;
 --safe-b:env(safe-area-inset-bottom)}
-:root.light{--bg:#f0f2f5;--card:#ffffff;--card2:#f5f5f5;--text:#1a1a1a;--muted:#666666;
---line:#d8dde6;--green:#0ea571;--red:#e53935;--yellow:#e6a700;--accent:#d4880a}
+/* 浅色主题：白天 6:00-20:00 */
+:root.light{--bg:#ffffff;--card:#f5f5f5;--card2:#ebebeb;--text:#1a1a1a;--muted:#666666;
+--line:#d0d0d0;--green:#0ea571;--red:#e53935;--yellow:#e6a700;--accent:#d4880a}
+/* 浅色主题下的 K 线图适配 */
+:root.light .cp{background:var(--bg);border-color:var(--line)}
+:root.light .cw{background:#ffffff}
+:root.light canvas{background:#ffffff}
 *{box-sizing:border-box;-webkit-tap-highlight-color:transparent;outline:none}
 html{font-size:16px}body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC",sans-serif;
 color:var(--text);background:var(--bg);line-height:1.5;overflow-x:hidden}
@@ -1322,51 +1427,22 @@ align-items:center;border-radius:.5rem;cursor:pointer;transition:.1s;color:var(-
 </div>
 
 <script>
-// ==================== 东八区时间工具（稳定跨浏览器，不依赖 toLocaleString）====================
-// ★ 修复 Bug1: Safari/iOS 的 toLocaleString 返回 "上午9" 导致 parseInt 为 NaN
-const _SH_OFF = 8 * 3600 * 1000; // UTC+8，无夏令时
-
-function shTime(tsMs) {
-  // 将任意毫秒时间戳转为东八区时间分量
-  const d = new Date(tsMs + _SH_OFF);
-  return {
-    Y:  d.getUTCFullYear(),
-    Mo: d.getUTCMonth() + 1,
-    D:  d.getUTCDate(),
-    h:  d.getUTCHours(),
-    m:  d.getUTCMinutes(),
-    s:  d.getUTCSeconds()
-  };
-}
-
-function _p2(n) { return String(n).padStart(2, '0'); }
-
-/**
- * 格式化毫秒时间戳为东八区字符串
- * fmt: 'HH:mm' | 'M/D HH:mm' | 'HH:mm:ss' | 默认 'YYYY-MM-DD HH:mm:ss'
- */
-function fmtSH(tsMs, fmt) {
-  const t = shTime(tsMs);
-  if (fmt === 'HH:mm')     return `${_p2(t.h)}:${_p2(t.m)}`;
-  if (fmt === 'M/D HH:mm') return `${t.Mo}/${_p2(t.D)} ${_p2(t.h)}:${_p2(t.m)}`;
-  if (fmt === 'HH:mm:ss')  return `${_p2(t.h)}:${_p2(t.m)}:${_p2(t.s)}`;
-  return `${t.Y}-${_p2(t.Mo)}-${_p2(t.D)} ${_p2(t.h)}:${_p2(t.m)}:${_p2(t.s)}`;
-}
-
-// ==================== 主题切换（东八区 20:00-06:00 深色，其余浅色）====================
-function applyThemeByShanghaiTime() {
-  // ★ 修复 Bug1: 用 shTime 代替 toLocaleString
-  const h = shTime(Date.now()).h;
-  if (h >= 20 || h < 6) {
+// ==================== 主题切换（东八区 20:00-06:00 深色，其余浅色） ====================
+function applyThemeByShanghaiTime(){
+  const now=new Date();
+  const hour=now.toLocaleString('zh-CN',{timeZone:'Asia/Shanghai',hour:'2-digit',hour12:false});
+  const h=parseInt(hour,10);
+  // 20:00-23:59 和 00:00-06:00 为深色模式
+  if(h>=20||h<6){
     document.documentElement.classList.remove('light');
-  } else {
+  }else{
     document.documentElement.classList.add('light');
   }
-  // 主题切换后立即刷新 K 线颜色
-  if (cBars && cBars.length) drawK(); else drawE();
 }
+// 页面加载时应用主题
 applyThemeByShanghaiTime();
-setInterval(applyThemeByShanghaiTime, 60000);
+// 每分钟检查一次主题
+setInterval(applyThemeByShanghaiTime,60000);
 
 // ==================== 全局状态 ====================
 const $=id=>document.getElementById(id);
@@ -1379,13 +1455,12 @@ stock:["AAPL","AMZN","BABA","GOOGL","META","MSFT","NFLX","NVDA","TSLA","ABBV","A
 };
 const CN={forex:"外汇",metal:"贵金属",commodity:"大宗商品",index:"指数",crypto:"虚拟货币",stock:"股票"};
 let S="EURUSD",C="forex",TF="5min",lastM=null,stag=0,sigP=0;
-let cBars=[];
-let L=null; // ★ 修复 Bug4: 正式声明全局变量，避免严格模式报错
+let cBars=[];   // 全量 K 线数据
 
 // ==================== K线视口状态 ====================
-let vStart=0;
-let vBars=60;
-const V_MIN=10, V_MAX=200;
+let vStart=0;          // 当前视图起始索引（可以是小数）
+let vBars=60;          // 当前视图可见 Bar 数量
+const V_MIN=10, V_MAX=200;  // 缩放范围
 
 // 十字光标状态
 let crosshair={active:false,x:0,y:0,barIdx:-1};
@@ -1403,7 +1478,7 @@ if(!fx.some(c=>u.includes(c)))return 2;
 return 5;}
 function fm(n,d){return n!=null?parseFloat(n).toFixed(d):'--'}
 
-// Y轴区间自适应算法
+// Y轴区间自适应算法（智能 padding + 网格分度）
 function nS(lo,hi,mt){
 if(lo===hi){const d=lo===0?1:Math.abs(lo)*.01;lo-=d;hi+=d}
 const r=hi-lo,p=r*.08;let mn=lo-p,mx=hi+p;
@@ -1428,14 +1503,6 @@ if(!cBars||cBars.length===0){drawE();return}
 const PL=8,PR=76,PT=16,PB=32,cW=w-PL-PR,cH=h-PT-PB;
 if(cW<=0||cH<=0)return;
 
-// ★ 修复 Bug3: 根据主题动态选色，不再硬编码深色值
-const isLight = document.documentElement.classList.contains('light');
-const G  = isLight ? '#0ea571' : '#0ecb81';   // 阳线
-const R  = isLight ? '#e53935' : '#f6465d';   // 阴线
-const gr = isLight ? 'rgba(0,0,0,0.07)'       // 网格线（浅色主题可见）
-                   : 'rgba(255,255,255,0.04)'; // 网格线（深色主题）
-const ax = isLight ? '#555555' : '#5e6673';   // 轴标签
-
 // 计算当前视图
 const totalBars=cBars.length;
 const endIdx=Math.min(vStart+vBars,totalBars);
@@ -1444,10 +1511,11 @@ const endIdxF=Math.min(endIdx,totalBars);
 const visibleCount=endIdxF-startIdxF;
 if(visibleCount<=0){drawE();return}
 
+// 提取可见 bars
 const vb=cBars.slice(Math.floor(startIdxF),Math.ceil(endIdxF));
 const n=vb.length;
 
-// Y轴自动缩放
+// ---- Y轴自动缩放（基于可见范围）----
 let dMin=Infinity,dMax=-Infinity;
 for(const b of vb){
   if(b[2]>dMax)dMax=b[2];
@@ -1457,17 +1525,20 @@ const D=dg(S),sc=nS(dMin,dMax,6);
 const yI=sc.tI,yA=sc.tA,yR=yA-yI||1;
 const p2y=p=>PT+cH*(1-(p-yI)/yR),y2p=y=>yI+(1-(y-PT)/cH)*yR;
 
-// X轴 bar 宽度
-const bT=cW/visibleCount;
+// ---- X轴：每个 bar 宽度动态计算 ----
+const bT=cW/visibleCount;    // 小数精度
 const gap=Math.max(1,Math.round(bT*.2));
 const bW=Math.max(1,Math.floor(bT-gap));
 const hB=bW/2;
+// bar 索引 → 画布 x 坐标（支持小数索引）
 const bxAt=(idx)=>PL+(idx-startIdxF+0.5)*bT;
 
-// 更新全局布局缓存
 L={PL,PR,PT,PB,cW,cH,bT,vBars,startIdxF,endIdxF,yI,yA,yR,p2y,y2p,D,vb,totalBars};
 
-// 绘制网格 & Y轴标签
+// 颜色
+const G='#0ecb81',R='#f6465d',gr='rgba(255,255,255,0.04)',ax='#5e6673';
+
+// ---- 绘制网格 & Y轴标签 ----
 ctx.font='11px "SF Mono",Menlo,monospace';
 ctx.textAlign='left';
 ctx.textBaseline='middle';
@@ -1479,58 +1550,68 @@ for(const t of sc.tk){
   ctx.fillStyle=ax;ctx.fillText(t.toFixed(D),PL+cW+6,y)
 }
 
-// 绘制烛台
+// ---- 绘制烛台 ----
 for(let i=0;i<n;i++){
   const b=vb[i];
+  // 计算这个 bar 在画布上的精确 x
   const barIdx=Math.floor(startIdxF)+i;
   const x=bxAt(barIdx);
   const o=b[1],hi=b[2],lo=b[3],cl=b[4];
   const up=cl>=o,col=up?G:R;
+  // 上影线
   ctx.strokeStyle=col;ctx.lineWidth=1;
   ctx.beginPath();ctx.moveTo(Math.round(x)+.5,Math.round(p2y(hi)));ctx.lineTo(Math.round(x)+.5,Math.round(p2y(lo)));ctx.stroke();
+  // 实体
   const yO=p2y(o),yC=p2y(cl),bt=Math.min(yO,yC),bh=Math.abs(yC-yO);
   ctx.fillStyle=col;
   ctx.fillRect(Math.round(x-hB),Math.round(bt),Math.max(1,bW),Math.max(1,bh));
 }
 
-// 最新价虚线
+// ---- 最新价虚线（跟随视图最右侧）----
 const lastBarIdx=Math.min(Math.floor(endIdxF)-1,totalBars-1);
 if(lastBarIdx>=0){
   const lastBar=cBars[lastBarIdx];
   const lc=lastBar[4],up=lc>=lastBar[1],col=up?G:R,yL=p2y(lc);
   ctx.setLineDash([4,3]);ctx.strokeStyle=col;ctx.lineWidth=1;
   ctx.beginPath();ctx.moveTo(PL,Math.round(yL)+.5);ctx.lineTo(PL+cW,Math.round(yL)+.5);ctx.stroke();ctx.setLineDash([]);
+  // 价格标签
   const tW=PR-6,tH=18,tX=PL+cW+2,tY=Math.round(yL)-tH/2;
   ctx.fillStyle=col;ctx.beginPath();ctx.roundRect(tX,tY,tW,tH,3);ctx.fill();
   ctx.fillStyle='#fff';ctx.font='bold 11px "SF Mono",Menlo,monospace';ctx.textAlign='center';ctx.textBaseline='middle';
   ctx.fillText(lc.toFixed(D),tX+tW/2,Math.round(yL));
 }
 
-// X轴标签
-// ★ 修复 Bug1: 用 fmtSH 代替 toLocaleString，Safari/iOS 稳定显示
+// ---- X轴标签 ----
 ctx.fillStyle=ax;ctx.font='10px "SF Mono",Menlo,monospace';ctx.textAlign='center';ctx.textBaseline='top';
 const mG=60,iMs=TF==='1hour'?3600000*4:TF==='10min'?3600000:1800000;
 let lX=-Infinity;
+// 每隔一定像素间距画一个时间标签
 for(let i=0;i<visibleCount;i++){
   const barIdx=Math.floor(startIdxF)+i;
   if(barIdx<0||barIdx>=totalBars)continue;
   const ts=cBars[barIdx][0],x=bxAt(barIdx);
   if(barIdx!==0&&barIdx!==totalBars-1&&ts%iMs!==0)continue;
   if(x-lX<mG&&barIdx!==0&&barIdx!==totalBars-1)continue;
-  const lb = TF==='1hour' ? fmtSH(ts,'M/D HH:mm') : fmtSH(ts,'HH:mm');
+  const d=new Date(ts);
+  let lb;
+  if(TF==='1hour'){
+    lb=d.toLocaleString('zh-CN',{timeZone:'Asia/Shanghai',month:'numeric',day:'numeric',hour:'2-digit',hour12:false});
+  }else{
+    lb=d.toLocaleString('zh-CN',{timeZone:'Asia/Shanghai',hour:'2-digit',minute:'2-digit',hour12:false});
+  }
   ctx.strokeStyle=gr;ctx.lineWidth=1;
   ctx.beginPath();ctx.moveTo(Math.round(x)+.5,PT+cH);ctx.lineTo(Math.round(x)+.5,PT+cH+4);ctx.stroke();
   ctx.fillStyle=ax;ctx.fillText(lb,x,PT+cH+6);lX=x;
 }
 
-// 拖拽时滚动条
+// ---- 拖拽时显示位置指示 ----
 if(isDragging){
   const pct=(vStart/(totalBars-vBars))*100;
   const barPct=vBars/totalBars*100;
   drawScrollBar(pct,barPct);
 }
 
-// 十字光标
+// ---- 十字光标（覆盖层）----
 drawCrosshair();
 }
 
@@ -1541,9 +1622,9 @@ const dpr=devicePixelRatio||1,w=cv.offsetWidth,h=cv.offsetHeight;
 const H=4,y=h-H-4;
 const barW=w*barPct/100;
 const thumbX=w*posPct/100;
-ctx.fillStyle='rgba(128,128,128,0.2)';
+ctx.fillStyle='rgba(255,255,255,0.15)';
 ctx.fillRect(0,y,w,H);
-ctx.fillStyle='rgba(128,128,128,0.5)';
+ctx.fillStyle='rgba(255,255,255,0.5)';
 ctx.fillRect(Math.round(thumbX),y,Math.max(4,Math.round(barW)),H);
 }
 
@@ -1551,12 +1632,8 @@ function drawE(){
 const cv=$('kc');if(!cv)return;
 const ctx=cv.getContext('2d'),dpr=devicePixelRatio||1,w=cv.offsetWidth,h=cv.offsetHeight;
 cv.width=w*dpr;cv.height=h*dpr;ctx.scale(dpr,dpr);ctx.clearRect(0,0,w,h);
-// ★ 修复 Bug3: 空状态文字颜色适配主题
-const isLight = document.documentElement.classList.contains('light');
-ctx.fillStyle = isLight ? '#888888' : '#5e6673';
-ctx.font='13px sans-serif';ctx.textAlign='center';ctx.textBaseline='middle';
-ctx.fillText('暂无 K 线数据',w/2,h/2);
-L=null;crosshair={active:false,x:0,y:0,barIdx:-1};
+ctx.fillStyle='#5e6673';ctx.font='13px sans-serif';ctx.textAlign='center';ctx.textBaseline='middle';
+ctx.fillText('暂无 K 线数据',w/2,h/2);L=null;crosshair={active:false,x:0,y:0,barIdx:-1};
 }
 
 // ==================== 十字光标 ====================
@@ -1567,44 +1644,32 @@ cv.width=w*dpr;cv.height=h*dpr;cv.getContext('2d').scale(dpr,dpr);
 if(!crosshair.active||!L){cv.getContext('2d').clearRect(0,0,w,h);return}
 const ctx=cv.getContext('2d');
 ctx.clearRect(0,0,w,h);
-
-// ★ 修复 Bug3: 十字光标颜色适配主题
-const isLight = document.documentElement.classList.contains('light');
-const chCross = isLight ? 'rgba(0,0,0,0.2)'   : 'rgba(255,255,255,0.25)';
-const chBg    = isLight ? '#c8cdd6'            : '#2b3139';
-const chText  = isLight ? '#1a1a1a'            : '#eaecef';
-
 const{PL,PT,cW,cH,bT,startIdxF,D,vb,totalBars}=L;
 const cx=Math.max(PL,Math.min(crosshair.x,PL+cW)),cy=Math.max(PT,Math.min(crosshair.y,PT+cH));
 const fracIdx=startIdxF+(cx-PL)/bT;
 const idx=Math.max(0,Math.min(Math.floor(fracIdx),totalBars-1));
-
-// 十字线
-ctx.setLineDash([3,3]);ctx.strokeStyle=chCross;ctx.lineWidth=1;
+ctx.setLineDash([3,3]);ctx.strokeStyle='rgba(255,255,255,0.25)';ctx.lineWidth=1;
 ctx.beginPath();ctx.moveTo(Math.round(cx)+.5,PT);ctx.lineTo(Math.round(cx)+.5,PT+cH);ctx.stroke();
 ctx.beginPath();ctx.moveTo(PL,Math.round(cy)+.5);ctx.lineTo(PL+cW,Math.round(cy)+.5);ctx.stroke();
 ctx.setLineDash([]);
-
-// Y轴价格标签
-const pr=L.y2p(cy);
+const pr=L.y2p(cy);ctx.fillStyle='#2b3139';
 const tW2=64,tH2=18,tX2=PL+cW+2,tY2=Math.round(cy)-tH2/2;
-ctx.fillStyle=chBg;
 ctx.beginPath();ctx.roundRect(tX2,tY2,tW2,tH2,3);ctx.fill();
-ctx.fillStyle=chText;ctx.font='11px "SF Mono",Menlo,monospace';ctx.textAlign='center';ctx.textBaseline='middle';
+ctx.fillStyle='#eaecef';ctx.font='11px "SF Mono",Menlo,monospace';ctx.textAlign='center';ctx.textBaseline='middle';
 ctx.fillText(pr.toFixed(D),tX2+tW2/2,Math.round(cy));
-
 if(idx>=0&&idx<totalBars){
-  const b=cBars[idx],ts=b[0];
-  // ★ 修复 Bug1: 用 fmtSH 代替 toLocaleString
-  const lb = TF==='1hour' ? fmtSH(ts,'M/D HH:mm') : fmtSH(ts,'HH:mm');
+  const b=cBars[idx],ts=b[0],d=new Date(ts);
+  let lb;if(TF==='1hour'){
+    lb=d.toLocaleString('zh-CN',{timeZone:'Asia/Shanghai',month:'numeric',day:'numeric',hour:'2-digit',hour12:false});
+  }else{
+    lb=d.toLocaleString('zh-CN',{timeZone:'Asia/Shanghai',hour:'2-digit',minute:'2-digit',hour12:false});
+  }
   const x=bxAtGlobal(idx);
   const tw=ctx.measureText(lb).width+12,tx=Math.round(x)-tw/2,ty=PT+cH+2;
-  ctx.fillStyle=chBg;ctx.beginPath();ctx.roundRect(tx,ty,tw,16,3);ctx.fill();
-  ctx.fillStyle=chText;ctx.font='10px "SF Mono",Menlo,monospace';ctx.textAlign='center';ctx.textBaseline='top';
+  ctx.fillStyle='#2b3139';ctx.beginPath();ctx.roundRect(tx,ty,tw,16,3);ctx.fill();
+  ctx.fillStyle='#eaecef';ctx.font='10px "SF Mono",Menlo,monospace';ctx.textAlign='center';ctx.textBaseline='top';
   ctx.fillText(lb,Math.round(x),ty+2);
-  const o=b[1],hi=b[2],lo=b[3],cl=b[4],up=cl>=o;
-  const isLightInner = document.documentElement.classList.contains('light');
-  const c2=up?(isLightInner?'#0ea571':'#0ecb81'):(isLightInner?'#e53935':'#f6465d');
+  const o=b[1],hi=b[2],lo=b[3],cl=b[4],up=cl>=o,c2=up?'#0ecb81':'#f6465d';
   $('oI').innerHTML=`<span style="color:${c2}">O:${o.toFixed(D)} H:${hi.toFixed(D)} L:${lo.toFixed(D)} C:${cl.toFixed(D)}</span>`
 }else{
   $('oI').innerText='';
@@ -1644,6 +1709,7 @@ const delta=e.deltaY<0?1:-1;
 const factor=delta>0?0.85:1.18;
 const newVBars=Math.max(V_MIN,Math.min(V_MAX,Math.round(vBars*factor)));
 if(newVBars===vBars)return;
+// 以鼠标位置为中心缩放
 const mouseX=e.offsetX;
 const frac=(mouseX-L.PL)/L.cW;
 const mouseIdx=vStart+frac*vBars;
@@ -1673,7 +1739,7 @@ if(newVBars!==vBars){
   const relX=midX-rect.left;
   if(L&&L.cW>0){
     const frac=relX/L.cW;
-    const midIdx=vStart+frac*vBars;
+    const midIdx=vStart+frac*vBars;  // 正确计算双指中心对应的 bar 索引
     vBars=newVBars;
     const scrollable=cBars.length-vBars;
     vStart=scrollable>0?Math.max(0,Math.min(midIdx-frac*vBars,scrollable)):0;
@@ -1689,11 +1755,20 @@ if(newVBars!==vBars){
 // ==================== 交互绑定 ====================
 (function(){
 const wr=$('cW');if(!wr)return;
-const cc=$('cc');if(cc){cc.style.pointerEvents='none';}
+const cc=$('cc');if(cc){
+  cc.style.pointerEvents='none';
+}
+function pos(e){const r=wr.getBoundingClientRect();
+  return e.touches?{x:e.touches[0].clientX-r.left,y:e.touches[0].clientY-r.top}:{x:e.clientX-r.left,y:e.clientY-r.top}}
+
+// 鼠标
 wr.addEventListener('mousedown',e=>{if(e.button===0){onDragStart(e.offsetX)}});
 wr.addEventListener('mousemove',e=>{
   if(isDragging){onDragMove(e.offsetX)}
-  else{crosshair.active=true;crosshair.x=e.offsetX;crosshair.y=e.offsetY;drawCrosshair();}
+  else{
+    crosshair.active=true;crosshair.x=e.offsetX;crosshair.y=e.offsetY;
+    drawCrosshair();
+  }
 });
 wr.addEventListener('mouseleave',()=>{
   if(isDragging){isDragging=false;drawK()}
@@ -1701,6 +1776,8 @@ wr.addEventListener('mouseleave',()=>{
 });
 wr.addEventListener('mouseup',()=>{if(isDragging)onDragEnd()});
 wr.addEventListener('wheel',onWheel,{passive:false});
+
+// 触摸
 wr.addEventListener('touchstart',e=>{
   if(e.touches.length===1){onDragStart(e.touches[0].clientX-wr.getBoundingClientRect().left)}
   else if(e.touches.length===2){onPinchStart(e.touches)}
@@ -1720,8 +1797,12 @@ wr.addEventListener('touchend',e=>{
 
 // ==================== 业务逻辑 ====================
 function tick(){
-  // ★ 修复 Bug1: 用 fmtSH 代替 toLocaleString，跨浏览器稳定
-  $('clk').innerText = fmtSH(Date.now(), 'HH:mm:ss');
+  // 使用东八区时间显示
+  const now=new Date();
+  const hour=now.toLocaleString('zh-CN',{timeZone:'Asia/Shanghai',hour:'2-digit',hour12:false});
+  const minute=now.toLocaleString('zh-CN',{timeZone:'Asia/Shanghai',minute:'2-digit',hour12:false});
+  const second=now.toLocaleString('zh-CN',{timeZone:'Asia/Shanghai',second:'2-digit',hour12:false});
+  $('clk').innerText=[hour,minute,second].map(v=>v.padStart(2,'0')).join(':');
 }
 function stab(b,c){document.querySelectorAll('.tab').forEach(t=>t.classList.remove('on'));b.classList.add('on');C=c}
 function openM(){$('mTi').innerText='切换'+(CN[C]||'品种');
@@ -1732,7 +1813,8 @@ function pick(s){
   $('sN').innerText=s;$('msk').style.display='none';
   ['bP','aP','mP','mP2','sV','bB','bA'].forEach(id=>{if($(id))$(id).innerText='--'});
   $('sT').innerText='点差: --';lastM=null;stag=0;
-  drawE();rf();fK();
+  drawE();rf();fK()
+// 重置视图
   vStart=0;vBars=60;
 }
 function detectCategoryBySymbol(sym){
@@ -1753,16 +1835,19 @@ const pe=$('mP');pe.classList.remove('up','down');
 if(prev!=null){if(mid>prev)pe.classList.add('up');else if(mid<prev)pe.classList.add('down')}
 const sp=q.spread!=null?q.spread:((a-b)*Math.pow(10,D>2?0:(5-D))).toFixed(1);
 $('sV').innerText=sp;$('sT').innerText='点差: '+sp}
+// 优先使用后端返回的时差字段
 if(q.latency_ms!=null&&Number.isFinite(q.latency_ms)){
   const lat=Math.round(q.latency_ms);
   if(Math.abs(lat)<=600000){$('lT').innerText='延迟: '+lat+'ms';lSig(lat)}
   else{$('lT').innerText='延迟: --';lSig(99999)}
 }else if(q.quote_time_shanghai){
+  // 后端没有 latency 但有 quote_time_shanghai，显示更新时间
   const t=q.quote_time_shanghai.split(' ')[1]||q.quote_time_shanghai;
   $('lT').innerText='更新: '+t;lSig(99999);
 }else{
   $('lT').innerText='延迟: --';lSig(99999);
 }
+// 优先使用后端返回的东八区时间
 if(q.quote_time_shanghai){
   $('uT').innerText='数据: '+q.quote_time_shanghai;
 }else if(q.server_time_shanghai){
@@ -1781,6 +1866,7 @@ const maxLimit=TF==='5min'?300:TF==='10min'?250:200;
 const r=await fetch('/api/kline?symbol='+encodeURIComponent(S)+'&tf='+encodeURIComponent(TF)+'&limit='+maxLimit),d=await r.json();
 if(d.bars&&d.bars.length>0){
   cBars=d.bars;
+  // 保持当前视图位置（如果新数据比当前视图更靠后，则跟随）
   const scrollable=Math.max(0,cBars.length-vBars);
   vStart=Math.min(vStart,scrollable);
   drawK();
@@ -1799,8 +1885,9 @@ function chkS(){const p=parseFloat($('mP')?.innerText)||0;
 if(sigP===p&&p>0){stag++;if(stag>=5){const s=$('lS');if(s){s.className='sg';s.classList.add('r')}$('lT').innerText='数据停滞!'}}
 else stag=0;sigP=p}
 
-// K线实时刷新（追加新 bar，跟随最新）
+// 实时更新：追加新 bar，跟随最新（如果当前在看最新）
 let lastKlineLen=0;
+const origFetchKline=fK;
 setInterval(async()=>{
 try{
 const maxLimit=TF==='5min'?300:TF==='10min'?250:200;
@@ -1819,7 +1906,6 @@ drawK();
 },2000);
 
 setInterval(chkS,2000);
-// ★ 修复 Bug1: tick() 使用 fmtSH，Safari 上不再显示 NaN:NaN:NaN
 tick();setInterval(tick,1000);
 addEventListener('resize',()=>{clearTimeout(window._rt);window._rt=setTimeout(()=>{if(cBars.length)drawK();else drawE()},100)});
 rf();fK();
